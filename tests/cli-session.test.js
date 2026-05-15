@@ -149,6 +149,47 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     const controls = JSON.parse(controlsResult.stdout);
     assert.equal(controls.autoFit, true);
 
+    await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"constant","value":[1,1,1,1]}}}',
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
+      'behaviors.update',
+      '--json',
+      '{"id":"appearance","options":{"shaded":{"enabled":true,"nodes":true},"ambientOcclusion":{"enabled":true,"nodes":true}}}',
+    ]);
+    const savedResult = await runCli([
+      'call',
+      session.sessionId,
+      'persistence.save',
+      '--json',
+      '{"fullSession":true}',
+    ], { timeout: 120_000 });
+    const saved = JSON.parse(savedResult.stdout);
+    assert.equal(saved.id, `helios-cli:${session.sessionId}`);
+
+    const reloadedResult = await runCli([
+      'call',
+      session.sessionId,
+      'browser.reload',
+      '--json',
+      '{"timeoutMs":30000}',
+    ], { timeout: 120_000 });
+    const reloaded = JSON.parse(reloadedResult.stdout);
+    assert.equal(reloaded.reloaded, true);
+
+    const restoredStateResult = await runCli(['call', session.sessionId, 'scene.getState'], { timeout: 120_000 });
+    const restoredState = JSON.parse(restoredStateResult.stdout);
+    assert.deepEqual(restoredState.mappers.node.color.value, [1, 1, 1, 1]);
+    assert.equal(restoredState.behaviors.attached.appearance.state.shaded.enabled, true);
+    assert.equal(restoredState.behaviors.attached.appearance.state.ambientOcclusion.enabled, true);
+    assert.ok(restoredState.network.nodeAttributes.includes('agent_position'));
+
     const exportPath = path.join(os.tmpdir(), `helios-cli-export-${session.sessionId}.png`);
     await runCli([
       'call',

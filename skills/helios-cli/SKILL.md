@@ -50,7 +50,8 @@ helios session start --mode headed --renderer webgpu --network ./graph.bxnet
 2. Start with `--mode headless` for automated rendering/export, or `--mode headed` when human visual inspection matters.
 3. Capture the JSON session metadata from `session start`; all subsequent calls need `sessionId`.
 4. Use `scene.getState` before changes and after changes to confirm renderer, network counts, layout state, mapper state, labels, legends, density, filters, and camera state.
-5. Stop sessions with `helios session stop <sessionId>` when finished.
+5. Use `persistence.save` before intentional reloads or handoff points when the current visual state matters.
+6. Stop sessions with `helios session stop <sessionId>` when finished.
 
 ## References
 
@@ -62,3 +63,4 @@ helios session start --mode headed --renderer webgpu --network ./graph.bxnet
 - `references/metrics.md` covers graph/aesthetic measurements and writing results into node attributes.
 - `references/behaviors.md` covers enabling, disabling, updating, detaching, restoring, and invoking Helios behaviors.
 - `references/positions.md` covers custom positions, positions from attributes, and position snapshots.
+- `references/persistence.md` covers automatic session persistence, browser reload recovery, and explicit save/restore calls.

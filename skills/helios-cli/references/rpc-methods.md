@@ -62,6 +62,14 @@ Omit `--json` when the method takes no payload.
 - `density.get`, `density.set`
 - `metrics.measure`, `aesthetic.measure`: run graph/aesthetic measurements such as degree, strength, clustering, coreness, centralities, connected components, dimension, and Leiden.
 
+## Persistence
+
+- `persistence.get`: returns the CLI persistence id, localStorage fallback key, and availability.
+- `persistence.save`: payload can include `{ "fullSession": true, "networkFormat": "bxnet" }`. Full saves persist network data plus visualization state; lightweight saves persist only visualization fallback state.
+- `persistence.restore`: restores the current session checkpoint without reloading the page.
+- `persistence.clear`: removes the IndexedDB session checkpoint and localStorage visualization fallback.
+- `browser.reload`: reloads the managed browser page, waits for the Helios runtime and bridge to reconnect, then returns runtime and session metadata.
+
 ## Picking And Export
 
 - `picking.pick`: payload `{ "x": 400, "y": 300 }`.

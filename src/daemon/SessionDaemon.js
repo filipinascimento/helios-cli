@@ -441,6 +441,8 @@ export class SessionDaemon {
         return this.handleNetworkSave(params);
       case 'export.figure':
         return this.handleExportFigure(params);
+      case 'browser.reload':
+        return this.handleBrowserReload(params);
       default:
         return this.callBridge(method, params);
     }
@@ -578,6 +580,26 @@ export class SessionDaemon {
       wroteFile: Boolean(outputPath && result?.base64),
       outputPath: outputPath ?? null,
       base64: outputPath ? undefined : result?.base64,
+    };
+  }
+
+  async handleBrowserReload(params = {}) {
+    if (!this.browserPage) {
+      const error = new Error('browser.reload requires a managed headed or headless browser session');
+      error.code = -32602;
+      throw error;
+    }
+    this.bridgeReady = false;
+    await this.updateMetadata();
+    await this.browserPage.reload({ waitUntil: params.waitUntil ?? 'networkidle' });
+    await this.browserPage.waitForFunction(() => Boolean(window.__HELIOS_CLI_RUNTIME__?.ready), null, {
+      timeout: params.timeoutMs ?? 30_000,
+    });
+    await this.waitForBridge({ timeoutMs: params.timeoutMs ?? 30_000 });
+    return {
+      reloaded: true,
+      runtime: await this.browserPage.evaluate(() => window.__HELIOS_CLI_RUNTIME__ ?? null),
+      metadata: this.buildMetadata(),
     };
   }
 

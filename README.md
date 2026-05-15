@@ -22,6 +22,8 @@ npm link
 
 The package intentionally uses `file:../helios-network-v2` and `file:../helios-web-next` so CLI sessions run against the current local Helios Network and Helios Web source. The Vite build uses `../helios-web-next/src/index.js` when it exists.
 
+CLI browser sessions automatically checkpoint network and visualization state by session id. A page reload restores the saved network, camera, mode, layout, mappers, behaviors, filters, density, labels, and legends when possible.
+
 ## Basic Usage
 
 ```sh
@@ -30,6 +32,8 @@ helios session start --mode headless --renderer webgpu
 helios session list
 helios call <sessionId> scene.getState
 helios call <sessionId> camera.frame --json '{"animate":true,"durationMs":500}'
+helios call <sessionId> persistence.save --json '{"fullSession":true}'
+helios call <sessionId> browser.reload
 helios call <sessionId> export.figure --json '{"format":"png","preset":"window","outputPath":"./figure.png"}'
 helios session stop <sessionId>
 ```
@@ -58,6 +62,11 @@ Supported network extensions are `.bxnet`, `.zxnet`, and `.xnet`.
 - `scene.getState`
 - `scene.requestRender`
 - `scene.setMode`
+- `persistence.get`
+- `persistence.save`
+- `persistence.restore`
+- `persistence.clear`
+- `browser.reload`
 - `network.stats`
 - `network.load`
 - `network.replace`

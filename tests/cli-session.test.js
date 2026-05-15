@@ -152,6 +152,13 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     await runCli([
       'call',
       session.sessionId,
+      'scene.setMode',
+      '--json',
+      '{"mode":"3d"}',
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
       'mappers.set',
       '--json',
       '{"nodeMapper":{"color":{"type":"constant","value":[1,1,1,1]}}}',
@@ -185,6 +192,7 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
 
     const restoredStateResult = await runCli(['call', session.sessionId, 'scene.getState'], { timeout: 120_000 });
     const restoredState = JSON.parse(restoredStateResult.stdout);
+    assert.equal(restoredState.mode, '3d');
     assert.deepEqual(restoredState.mappers.node.color.value, [1, 1, 1, 1]);
     assert.equal(restoredState.behaviors.attached.appearance.state.shaded.enabled, true);
     assert.equal(restoredState.behaviors.attached.appearance.state.ambientOcclusion.enabled, true);

@@ -58,3 +58,5 @@ helios session start --mode headed --renderer webgpu --network ./graph.bxnet
 - `references/mappers.md` explains mapper descriptors for node and edge visual channels.
 - `references/networks.md` covers loading, replacing, saving, and synthetic test networks.
 - `references/rendering-export.md` covers renderer choices, GPU policy, screenshots, and figure export.
+- `references/layouts.md` covers layout choices and parameter updates.
+- `references/metrics.md` covers graph/aesthetic measurements and writing results into node attributes.

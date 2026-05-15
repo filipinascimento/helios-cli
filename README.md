@@ -69,6 +69,7 @@ Supported network extensions are `.bxnet`, `.zxnet`, and `.xnet`.
 - `camera.controls`
 - `layout.get`
 - `layout.set`
+- `layout.setParameters`
 - `layout.start`
 - `layout.stop`
 - `mappers.get`
@@ -83,6 +84,8 @@ Supported network extensions are `.bxnet`, `.zxnet`, and `.xnet`.
 - `legends.set`
 - `density.get`
 - `density.set`
+- `metrics.measure`
+- `aesthetic.measure`
 - `picking.pick`
 - `export.figure`
 

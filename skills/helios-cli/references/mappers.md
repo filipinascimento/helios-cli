@@ -77,3 +77,43 @@ helios call "$SESSION" scene.getState
 ```
 
 Use `mappers.reset` when you need to return to Helios defaults.
+
+## Function-Like Custom Mappers
+
+JSON cannot carry JavaScript functions, so the CLI accepts code strings and compiles them in the browser session:
+
+- `transformCode`: becomes `transform(inputs, item, context)`.
+- `scaleCode`: becomes `scale(value, inputs, item, context)`.
+- rule `whenCode`: becomes `when(inputs, item, context)`.
+- rule `transformCode`: becomes that rule's transform callback.
+
+Expression strings are allowed:
+
+```sh
+helios call "$SESSION" mappers.set --json '{
+  "nodeMapper": {
+    "size": {
+      "type": "attribute",
+      "attributes": "degree",
+      "transformCode": "Math.max(4, inputs[0] * 2)"
+    }
+  }
+}'
+```
+
+Function bodies with `return` are also allowed:
+
+```sh
+helios call "$SESSION" mappers.set --json '{
+  "nodeMapper": {
+    "color": {
+      "type": "attribute",
+      "attributes": ["degree", "community"],
+      "transformCode": "const degree = inputs[0] ?? 0; const group = inputs[1] ?? 0; return degree > 10 ? group : 0;",
+      "colormap": "CET_L08-NeonBurst"
+    }
+  }
+}'
+```
+
+Use code-backed mappers only for trusted local agent workflows. They execute in the browser session.

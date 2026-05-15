@@ -45,6 +45,7 @@ Omit `--json` when the method takes no payload.
 
 - `layout.get`: returns current layout key, run state, and parameter descriptor.
 - `layout.set`: payload `{ "layout": "gpu-force" }`, `{ "layout": "static" }`, `{ "layout": "d3force3d" }`, `{ "layout": "worker:jitter" }`, or `{ "layout": "worker:force3d" }`.
+- `layout.setParameters`: patches writable parameters exposed by `layout.get`, for example `{ "outputScale": 7, "linkDistance": 1.2 }`.
 - `layout.start`: starts layout execution.
 - `layout.stop`: payload `{ "reason": "agent" }`.
 
@@ -55,6 +56,7 @@ Omit `--json` when the method takes no payload.
 - `labels.get`, `labels.set`
 - `legends.get`, `legends.set`
 - `density.get`, `density.set`
+- `metrics.measure`, `aesthetic.measure`: run graph/aesthetic measurements such as degree, strength, clustering, coreness, centralities, connected components, dimension, and Leiden.
 
 ## Picking And Export
 

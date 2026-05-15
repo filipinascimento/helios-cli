@@ -39,6 +39,44 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     assert.equal(state.network.nodeCount, 200);
     assert.equal(state.renderer, session.gpu.actualRenderer);
 
+    const layoutUpdateResult = await runCli([
+      'call',
+      session.sessionId,
+      'layout.setParameters',
+      '--json',
+      '{"outputScale":7}',
+    ]);
+    const layoutUpdate = JSON.parse(layoutUpdateResult.stdout);
+    assert.equal(layoutUpdate.changed.outputScale, 7);
+
+    const mapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      JSON.stringify({
+        nodeMapper: {
+          size: {
+            type: 'attribute',
+            attributes: 'weight',
+            transformCode: 'inputs[0] * 10 + 4',
+          },
+        },
+      }),
+    ]);
+    const mappers = JSON.parse(mapperResult.stdout);
+    assert.equal(mappers.node.size.meta.transformCode, 'inputs[0] * 10 + 4');
+
+    const degreeResult = await runCli([
+      'call',
+      session.sessionId,
+      'metrics.measure',
+      '--json',
+      '{"metric":"degree","options":{"nodes":[0,1,2],"outNodeAttribute":"degree"}}',
+    ]);
+    const degree = JSON.parse(degreeResult.stdout);
+    assert.deepEqual(degree.values, [2, 2, 2]);
+
     const controlsResult = await runCli([
       'call',
       session.sessionId,

@@ -56,6 +56,7 @@ function resolveRendererPreference(value) {
 }
 
 function cloneJsonSafe(value) {
+  if (ArrayBuffer.isView(value)) return Array.from(value);
   if (Array.isArray(value)) return value.map((entry) => cloneJsonSafe(entry));
   if (!value || typeof value !== 'object') return value;
   const out = {};
@@ -91,6 +92,47 @@ function serializeLayoutBinding(binding) {
     max: binding?.max ?? null,
     options: Array.isArray(binding?.options) ? cloneJsonSafe(binding.options) : null,
   };
+}
+
+function findLayoutBinding(helios, key) {
+  const layout = helios.layout();
+  const descriptor = typeof layout?.getParameterBindings === 'function'
+    ? layout.getParameterBindings()
+    : null;
+  const binding = descriptor?.bindings?.find((entry) => entry?.key === key) ?? null;
+  if (!binding) throw new Error(`Unknown layout parameter "${key}"`);
+  return binding;
+}
+
+function normalizeBindingValue(binding, value) {
+  if (binding?.type === 'boolean') return value === true || value === 'true' || value === 1;
+  if (binding?.type === 'number' || typeof binding?.get?.() === 'number') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) throw new Error(`Layout parameter "${binding.key}" expects a finite number`);
+    return numeric;
+  }
+  return value;
+}
+
+function applyLayoutParameters(helios, params = {}) {
+  const values = params.values ?? params.parameters ?? params;
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    throw new Error('layout.setParameters expects an object of parameter values');
+  }
+  const changed = {};
+  for (const [key, rawValue] of Object.entries(values)) {
+    if (key === 'values' || key === 'parameters' || key === 'reheat' || key === 'start') continue;
+    const binding = findLayoutBinding(helios, key);
+    if (typeof binding.set !== 'function') {
+      throw new Error(`Layout parameter "${key}" is read-only`);
+    }
+    const value = normalizeBindingValue(binding, rawValue);
+    binding.set(value);
+    changed[key] = typeof binding.get === 'function' ? cloneJsonSafe(binding.get()) : value;
+  }
+  if (params.start === true) helios.startLayout?.();
+  helios.requestRender?.();
+  return { changed, layout: getLayoutState(helios) };
 }
 
 function identifyLayout(layout) {
@@ -346,6 +388,125 @@ function buildMapper(mode, network, descriptor) {
   return mapper;
 }
 
+function compileMapperFunction(source, label) {
+  if (typeof source !== 'string' || !source.trim()) return null;
+  // Agents can pass either an expression or a function body. Arguments mirror
+  // Mapper.js custom callbacks: inputs, item, context.
+  const body = source.trim();
+  if (/\breturn\b/.test(body) || /[;{}]/.test(body)) {
+    return new Function('inputs', 'item', 'context', body);
+  }
+  return new Function('inputs', 'item', 'context', `return (${body});`);
+}
+
+function hydrateMapperFunctionConfig(config, label = 'mapper') {
+  if (Array.isArray(config)) return config.map((entry, index) => hydrateMapperFunctionConfig(entry, `${label}[${index}]`));
+  if (!config || typeof config !== 'object') return config;
+  const next = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === 'transformCode') {
+      next.transform = compileMapperFunction(value, `${label}.transformCode`);
+      next.meta = { ...(next.meta ?? config.meta ?? {}), transformCode: value };
+      continue;
+    }
+    if (key === 'scaleCode') {
+      next.scale = compileMapperFunction(value, `${label}.scaleCode`);
+      next.meta = { ...(next.meta ?? config.meta ?? {}), scaleCode: value };
+      continue;
+    }
+    if (key === 'whenCode') {
+      next.when = compileMapperFunction(value, `${label}.whenCode`);
+      next.meta = { ...(next.meta ?? config.meta ?? {}), whenCode: value };
+      continue;
+    }
+    next[key] = hydrateMapperFunctionConfig(value, `${label}.${key}`);
+  }
+  return next;
+}
+
+function buildMapperWithFunctions(mode, network, descriptor) {
+  return buildMapper(mode, network, hydrateMapperFunctionConfig(descriptor, `${mode}Mapper`));
+}
+
+function serializeMetricResult(result, { includeValuesByNode = false } = {}) {
+  const normalized = cloneJsonSafe(result);
+  if (!includeValuesByNode && normalized && typeof normalized === 'object') {
+    delete normalized.valuesByNode;
+  }
+  return normalized;
+}
+
+async function runSteppableSession(session, options = {}) {
+  const budget = Math.max(1, Number(options.budget ?? 500) || 500);
+  const maxSteps = Math.max(1, Number(options.maxSteps ?? 10000) || 10000);
+  let progress = null;
+  let steps = 0;
+  while (steps < maxSteps) {
+    progress = session.step({ budget });
+    steps += 1;
+    const phase = Number(progress?.phase ?? progress?.status ?? 0);
+    if (progress?.done === true || phase === 3 || phase === 5) break;
+    if (steps % 20 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  if (steps >= maxSteps) throw new Error(`Metric session did not finish within ${maxSteps} steps`);
+  const result = session.finalize(options.finalize ?? {});
+  session.dispose?.();
+  return { steps, progress: cloneJsonSafe(progress), result };
+}
+
+async function measureNetworkMetric(network, params = {}) {
+  const metric = String(params.metric ?? params.name ?? params.measure ?? '').trim();
+  const options = params.options ?? { ...params };
+  delete options.metric;
+  delete options.name;
+  delete options.measure;
+  const includeValuesByNode = params.includeValuesByNode === true || options.includeValuesByNode === true;
+  delete options.includeValuesByNode;
+
+  switch (metric) {
+    case 'degree':
+      return serializeMetricResult(network.measureDegree(options), { includeValuesByNode });
+    case 'strength':
+      return serializeMetricResult(network.measureStrength(options), { includeValuesByNode });
+    case 'localClustering':
+    case 'localClusteringCoefficient':
+    case 'clustering':
+      return serializeMetricResult(network.measureLocalClusteringCoefficient(options), { includeValuesByNode });
+    case 'coreness':
+      return serializeMetricResult(network.measureCoreness(options), { includeValuesByNode });
+    case 'eigenvector':
+    case 'eigenvectorCentrality':
+      return serializeMetricResult(network.measureEigenvectorCentrality(options), { includeValuesByNode });
+    case 'betweenness':
+    case 'betweennessCentrality':
+      return serializeMetricResult(network.measureBetweennessCentrality(options), { includeValuesByNode });
+    case 'connectedComponents':
+    case 'components':
+      return serializeMetricResult(network.measureConnectedComponents(options), { includeValuesByNode });
+    case 'dimension':
+      return serializeMetricResult(network.measureDimension(options), { includeValuesByNode: true });
+    case 'nodeDimension':
+      return serializeMetricResult(network.measureNodeDimension(params.node ?? options.node, options), { includeValuesByNode: true });
+    case 'leiden':
+    case 'leidenModularity':
+      return serializeMetricResult(network.leidenModularity(options), { includeValuesByNode: true });
+    case 'corenessSession': {
+      const session = network.createCorenessSession(options);
+      return serializeMetricResult(await runSteppableSession(session, params), { includeValuesByNode });
+    }
+    case 'connectedComponentsSession': {
+      const session = network.createConnectedComponentsSession(options);
+      return serializeMetricResult(await runSteppableSession(session, params), { includeValuesByNode });
+    }
+    case 'dimensionSession': {
+      const session = network.createDimensionSession(options);
+      return serializeMetricResult(await runSteppableSession(session, params), { includeValuesByNode: true });
+    }
+    default:
+      throw new Error(`Unknown metric "${metric}". Use degree, strength, localClustering, coreness, eigenvectorCentrality, betweennessCentrality, connectedComponents, dimension, nodeDimension, or leiden.`);
+  }
+}
+
 class BrowserBridge {
   constructor(socket, helios, ui) {
     this.socket = socket;
@@ -485,6 +646,7 @@ class BrowserBridge {
         this.helios.layout(instance);
         return getLayoutState(this.helios);
       },
+      'layout.setParameters': async (params) => applyLayoutParameters(this.helios, params),
       'layout.start': async (params) => {
         this.helios.startLayout(params?.algo ?? null, params?.params ?? null);
         return getLayoutState(this.helios);
@@ -499,8 +661,8 @@ class BrowserBridge {
       }),
       'mappers.set': async (params) => {
         const payload = {};
-        if (params.nodeMapper) payload.nodeMapper = buildMapper('node', this.helios.network, params.nodeMapper);
-        if (params.edgeMapper) payload.edgeMapper = buildMapper('edge', this.helios.network, params.edgeMapper);
+        if (params.nodeMapper) payload.nodeMapper = buildMapperWithFunctions('node', this.helios.network, params.nodeMapper);
+        if (params.edgeMapper) payload.edgeMapper = buildMapperWithFunctions('edge', this.helios.network, params.edgeMapper);
         this.helios.mappers(payload);
         return {
           node: serializeMapperCollection(this.helios.nodeMapper),
@@ -538,6 +700,8 @@ class BrowserBridge {
         this.helios.density(params);
         return cloneJsonSafe(this.helios.density());
       },
+      'metrics.measure': async (params) => measureNetworkMetric(this.helios.network, params),
+      'aesthetic.measure': async (params) => measureNetworkMetric(this.helios.network, params),
       'picking.pick': async (params) => this.helios.pickAttributesAt(params.x, params.y),
       'export.figurePayload': async (params) => {
         const blob = await this.helios.exportFigureBlob(params);

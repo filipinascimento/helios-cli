@@ -77,6 +77,68 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     const degree = JSON.parse(degreeResult.stdout);
     assert.deepEqual(degree.values, [2, 2, 2]);
 
+    const behaviorUpdateResult = await runCli([
+      'call',
+      session.sessionId,
+      'behaviors.update',
+      '--json',
+      '{"id":"hover","options":{"hoverConnectedEdges":false,"hoverAffectsOtherElements":true}}',
+    ]);
+    const hoverBehavior = JSON.parse(behaviorUpdateResult.stdout);
+    assert.equal(hoverBehavior.state.hoverConnectedEdges, false);
+    assert.equal(hoverBehavior.state.hoverAffectsOtherElements, true);
+
+    const legendsDisabledResult = await runCli([
+      'call',
+      session.sessionId,
+      'behaviors.setEnabled',
+      '--json',
+      '{"id":"legends","enabled":false}',
+    ]);
+    const legendsDisabled = JSON.parse(legendsDisabledResult.stdout);
+    assert.equal(legendsDisabled.state.enabled, false);
+
+    const attributeResult = await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'agent_position',
+        functionCode: 'return [ordinal * 2, ordinal * -1, 0];',
+        options: { type: 'float', dimension: 3 },
+      }),
+    ]);
+    const attributeStats = JSON.parse(attributeResult.stdout);
+    assert.ok(attributeStats.nodeAttributes.includes('agent_position'));
+
+    const positionsFromAttributeResult = await runCli([
+      'call',
+      session.sessionId,
+      'positions.fromAttribute',
+      '--json',
+      '{"attribute":"agent_position","stopLayout":true}',
+    ]);
+    const positionsFromAttribute = JSON.parse(positionsFromAttributeResult.stdout);
+    assert.equal(positionsFromAttribute.layout.runState, 'stopped');
+
+    const customPositionsResult = await runCli([
+      'call',
+      session.sessionId,
+      'positions.set',
+      '--json',
+      JSON.stringify({
+        values: [[0, 0, 0], [10, 5, 0], [20, 10, 0]],
+        dimension: 3,
+        stopLayout: true,
+        includeValues: true,
+        limit: 3,
+      }),
+    ]);
+    const customPositions = JSON.parse(customPositionsResult.stdout);
+    assert.deepEqual(customPositions.values.slice(0, 9), [0, 0, 0, 10, 5, 0, 20, 10, 0]);
+
     const controlsResult = await runCli([
       'call',
       session.sessionId,

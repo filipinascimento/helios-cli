@@ -58,3 +58,20 @@ Run control:
 helios call "$SESSION" layout.start
 helios call "$SESSION" layout.stop --json '{"reason":"agent"}'
 ```
+
+## Positions From Attributes
+
+Use a numeric 2D or 3D node attribute as layout positions:
+
+```sh
+helios call "$SESSION" positions.fromAttribute --json '{
+  "attribute": "umap_position",
+  "stopLayout": true
+}'
+```
+
+`layout.applyPositionAttribute` is an alias for the same workflow:
+
+```sh
+helios call "$SESSION" layout.applyPositionAttribute --json '{"attribute":"embedding3d"}'
+```

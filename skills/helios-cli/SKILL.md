@@ -60,3 +60,5 @@ helios session start --mode headed --renderer webgpu --network ./graph.bxnet
 - `references/rendering-export.md` covers renderer choices, GPU policy, screenshots, and figure export.
 - `references/layouts.md` covers layout choices and parameter updates.
 - `references/metrics.md` covers graph/aesthetic measurements and writing results into node attributes.
+- `references/behaviors.md` covers enabling, disabling, updating, detaching, restoring, and invoking Helios behaviors.
+- `references/positions.md` covers custom positions, positions from attributes, and position snapshots.

@@ -57,6 +57,13 @@ function resolveRendererPreference(value) {
 
 function cloneJsonSafe(value) {
   if (ArrayBuffer.isView(value)) return Array.from(value);
+  if (value instanceof Set) return Array.from(value).map((entry) => cloneJsonSafe(entry));
+  if (value instanceof Map) {
+    const out = {};
+    for (const [key, entry] of value.entries()) out[key] = cloneJsonSafe(entry);
+    return out;
+  }
+  if (typeof value === 'bigint') return value.toString();
   if (Array.isArray(value)) return value.map((entry) => cloneJsonSafe(entry));
   if (!value || typeof value !== 'object') return value;
   const out = {};
@@ -112,6 +119,61 @@ function normalizeBindingValue(binding, value) {
     return numeric;
   }
   return value;
+}
+
+function normalizeAttributeWriteValue(value) {
+  if (value && typeof value === 'object' && value.__typedArray) {
+    const ctor = globalThis[value.__typedArray];
+    if (typeof ctor !== 'function') throw new Error(`Unsupported typed array "${value.__typedArray}"`);
+    return new ctor(value.values ?? []);
+  }
+  return value;
+}
+
+function normalizeAttributeWriteOptions(options = {}) {
+  return {
+    ...(options ?? {}),
+    type: options?.type ?? 'float',
+  };
+}
+
+function compileAttributeFunction(source) {
+  if (typeof source !== 'string' || !source.trim()) return null;
+  const body = source.trim();
+  if (/\breturn\b/.test(body) || /[;{}]/.test(body)) {
+    return new Function('current', 'id', 'ordinal', 'network', 'context', body);
+  }
+  return new Function('current', 'id', 'ordinal', 'network', 'context', `return (${body});`);
+}
+
+function writeNetworkAttribute(network, params = {}) {
+  const scope = String(params.scope ?? 'node').trim().toLowerCase();
+  const name = params.name ?? params.attribute;
+  const names = params.names ?? params.attributes;
+  const options = normalizeAttributeWriteOptions(params.options ?? {
+    type: params.type,
+    dimension: params.dimension,
+    indexBy: params.indexBy,
+  });
+  const context = cloneJsonSafe(params.context ?? {});
+  const functionCode = params.functionCode ?? params.valueCode ?? null;
+  const value = functionCode
+    ? (current, id, ordinal, net) => compileAttributeFunction(functionCode)(current, id, ordinal, net, context)
+    : normalizeAttributeWriteValue(params.values ?? params.value);
+
+  if (scope === 'node') {
+    if (Array.isArray(names)) return network.nodeAttributes(names, value, options);
+    return network.nodeAttribute(name, value, options);
+  }
+  if (scope === 'edge') {
+    if (Array.isArray(names)) return network.edgeAttributes(names, value, options);
+    return network.edgeAttribute(name, value, options);
+  }
+  if (scope === 'network') {
+    if (Array.isArray(names)) return network.networkAttributes(names, value, options);
+    return network.networkAttribute(name, value, options);
+  }
+  throw new Error('network.attributeSet scope must be "node", "edge", or "network"');
 }
 
 function applyLayoutParameters(helios, params = {}) {
@@ -354,6 +416,173 @@ function getLayoutState(helios) {
   };
 }
 
+function serializeBehavior(behavior) {
+  if (!behavior) return null;
+  return {
+    id: behavior.id ?? behavior.constructor?.id ?? null,
+    options: cloneJsonSafe(behavior.options ?? {}),
+    state: cloneJsonSafe(behavior.state ?? null),
+    serialized: typeof behavior.serialize === 'function' ? cloneJsonSafe(behavior.serialize()) : null,
+  };
+}
+
+function getBehaviorState(helios) {
+  const entries = typeof helios.behaviors?.entries === 'function' ? helios.behaviors.entries() : [];
+  const attached = {};
+  for (const [id, behavior] of entries) {
+    attached[id] = serializeBehavior(behavior);
+  }
+  return {
+    attached,
+    serialized: cloneJsonSafe(helios.serializeBehaviorState?.() ?? {}),
+  };
+}
+
+function findBehavior(helios, id) {
+  const behavior = helios.getBehavior?.(id) ?? helios.behaviors?.get?.(id) ?? null;
+  if (!behavior) throw new Error(`Behavior "${id}" is not attached`);
+  return behavior;
+}
+
+function setBehaviorEnabled(helios, id, enabled, options = {}) {
+  const behavior = findBehavior(helios, id);
+  const value = enabled !== false;
+  if (typeof behavior.enabled === 'function') {
+    behavior.enabled(value);
+  } else if (behavior.state && Object.prototype.hasOwnProperty.call(behavior.state, 'enabled')) {
+    behavior.state.enabled = value;
+    behavior.emit?.('change', { reason: 'cli-enabled', state: cloneJsonSafe(behavior.state) });
+  } else if (value === false && options.detach === true) {
+    helios.behaviors?.detach?.(id);
+    return getBehaviorState(helios);
+  } else if (typeof behavior.update === 'function') {
+    behavior.update({ enabled: value });
+  } else {
+    throw new Error(`Behavior "${id}" does not expose enabled state`);
+  }
+  helios.requestRender?.();
+  return serializeBehavior(helios.getBehavior?.(id) ?? helios.behaviors?.get?.(id) ?? behavior);
+}
+
+function invokeBehavior(helios, params = {}) {
+  const id = params.id ?? params.behavior;
+  const method = params.method ?? params.accessor;
+  const args = Array.isArray(params.args) ? params.args : [];
+  if (!method || typeof method !== 'string') throw new Error('behaviors.call expects a method name');
+  if (method === 'attach' || method === 'detach' || method === 'constructor') {
+    throw new Error(`Refusing to call behavior method "${method}" through behaviors.call`);
+  }
+  const behavior = findBehavior(helios, id);
+  if (typeof behavior[method] !== 'function') {
+    throw new Error(`Behavior "${id}" does not expose method "${method}"`);
+  }
+  const result = behavior[method](...args);
+  helios.requestRender?.();
+  return {
+    result: result === behavior ? serializeBehavior(behavior) : cloneJsonSafe(result),
+    behavior: serializeBehavior(behavior),
+  };
+}
+
+function getPositionSourceState(helios) {
+  const raw = helios.positions?.() ?? null;
+  const delegate = raw?.delegate ?? null;
+  const source = {
+    source: raw?.source ?? null,
+    delegate: delegate
+      ? {
+          id: delegate.id ?? delegate.constructor?.name ?? 'delegate',
+          type: delegate.constructor?.name ?? null,
+          version: delegate.version ?? null,
+        }
+      : null,
+  };
+  return {
+    ...source,
+    choices: cloneJsonSafe(helios.getLayoutPositionAttributeChoices?.() ?? []),
+    layout: getLayoutState(helios),
+  };
+}
+
+function readPositionAttribute(helios, attribute = '_helios_visuals_position', options = {}) {
+  const network = helios.network;
+  const info = network?.getNodeAttributeInfo?.(attribute) ?? null;
+  if (!info) return { attribute, exists: false, count: 0, dimension: 0 };
+  const dimension = Math.max(1, Number(info.dimension ?? 1));
+  const includeValues = options.includeValues !== false;
+  const limit = options.limit == null ? null : Math.max(0, Number(options.limit) || 0);
+  let values = null;
+  let count = 0;
+  if (includeValues) {
+    network.withBufferAccess?.(() => {
+      const view = network.getNodeAttributeBuffer(attribute).view;
+      count = Math.floor(view.length / dimension);
+      const itemCount = limit == null ? count : Math.min(count, limit);
+      values = Array.from(view.slice(0, itemCount * dimension));
+    });
+  } else {
+    count = Math.floor((network.getNodeAttributeBuffer?.(attribute)?.view?.length ?? 0) / dimension);
+  }
+  return { attribute, exists: true, dimension, count, values };
+}
+
+async function snapshotPositions(helios, params = {}) {
+  const source = helios.positions?.() ?? { source: 'network' };
+  if (source?.source === 'delegate') {
+    const snapshot = await helios.snapshotDelegatePositions?.();
+    const limit = params.limit == null ? null : Math.max(0, Number(params.limit) || 0);
+    const values = snapshot
+      ? Array.from(snapshot.slice(0, limit == null ? snapshot.length : Math.min(snapshot.length, limit * 3)))
+      : null;
+    return {
+      source: 'delegate',
+      dimension: 3,
+      count: snapshot ? Math.floor(snapshot.length / 3) : 0,
+      values,
+    };
+  }
+  return { source: 'network', ...readPositionAttribute(helios, params.attribute ?? '_helios_visuals_position', params) };
+}
+
+function applyPositionsFromAttribute(helios, params = {}) {
+  const attribute = params.attribute ?? params.name ?? '_helios_visuals_position';
+  if (params.stopLayout === true) helios.stopLayout?.('cli:positions-from-attribute');
+  const wrote = helios.setLayoutPositionsFromNodeAttribute(attribute, params.options ?? {});
+  if (!wrote) throw new Error(`Could not apply node attribute "${attribute}" as layout positions`);
+  helios.behavior?.layout?.positionAttribute?.(attribute);
+  if (params.start === true) helios.startLayout?.();
+  helios.requestRender?.();
+  return getPositionSourceState(helios);
+}
+
+function setCustomPositions(helios, params = {}) {
+  const attribute = params.attribute ?? '_helios_visuals_position';
+  const rawValues = params.values ?? params.positions;
+  if (!Array.isArray(rawValues) && !ArrayBuffer.isView(rawValues)) {
+    throw new Error('positions.set expects a flat or nested values array');
+  }
+  const first = Array.isArray(rawValues) ? rawValues.find((entry) => entry != null) : null;
+  const nested = Array.isArray(first) || ArrayBuffer.isView(first);
+  const dimension = Number(params.dimension ?? (nested ? first.length : 3));
+  const rows = nested
+    ? rawValues.map((entry) => Array.from(entry))
+    : Array.from({ length: Math.floor(rawValues.length / dimension) }, (_, index) => (
+        Array.from(rawValues).slice(index * dimension, (index + 1) * dimension)
+      ));
+  const nodeIds = Array.isArray(params.nodes) ? params.nodes.map((entry) => Number(entry)) : null;
+  const byNode = nodeIds ? new Map(nodeIds.map((node, index) => [node, rows[index]])) : null;
+  writeNetworkAttribute(helios.network, {
+    scope: 'node',
+    name: attribute,
+    value: (current, id, ordinal) => byNode?.get(id) ?? rows[ordinal] ?? current ?? new Array(dimension).fill(0),
+    options: { type: params.type ?? 'float', dimension, indexBy: params.indexBy ?? 'auto' },
+  });
+  if (params.apply !== false) {
+    applyPositionsFromAttribute(helios, { attribute, stopLayout: params.stopLayout, start: params.start });
+  }
+  return snapshotPositions(helios, { attribute, includeValues: params.includeValues === true, limit: params.limit });
+}
+
 function getSceneState(helios) {
   return {
     mode: helios.mode(),
@@ -366,6 +595,8 @@ function getSceneState(helios) {
     legends: cloneJsonSafe(helios.legends?.() ?? null),
     density: cloneJsonSafe(helios.density?.() ?? null),
     filter: cloneJsonSafe(helios.getGraphFilter?.() ?? null),
+    behaviors: getBehaviorState(helios),
+    positions: getPositionSourceState(helios),
     layout: getLayoutState(helios),
     mappers: {
       node: serializeMapperCollection(helios.nodeMapper),
@@ -567,6 +798,14 @@ class BrowserBridge {
     return {
       'session.getInfo': async () => getSceneState(this.helios),
       'network.stats': async () => getNetworkStats(this.helios),
+      'network.attributeSet': async (params) => {
+        writeNetworkAttribute(this.helios.network, params);
+        if (params.applyAsPositions === true || params.positionAttribute === true) {
+          applyPositionsFromAttribute(this.helios, { attribute: params.name ?? params.attribute });
+        }
+        this.helios.requestRender?.();
+        return getNetworkStats(this.helios);
+      },
       'network.loadPayload': async (params) => {
         const file = fileFromBase64({
           name: params.name ?? `network.${params.format ?? 'bxnet'}`,
@@ -647,6 +886,7 @@ class BrowserBridge {
         return getLayoutState(this.helios);
       },
       'layout.setParameters': async (params) => applyLayoutParameters(this.helios, params),
+      'layout.applyPositionAttribute': async (params) => applyPositionsFromAttribute(this.helios, params),
       'layout.start': async (params) => {
         this.helios.startLayout(params?.algo ?? null, params?.params ?? null);
         return getLayoutState(this.helios);
@@ -676,6 +916,40 @@ class BrowserBridge {
           edge: serializeMapperCollection(this.helios.edgeMapper),
         };
       },
+      'behaviors.get': async () => getBehaviorState(this.helios),
+      'behaviors.use': async (params) => {
+        const id = params.id ?? params.behavior;
+        const behavior = this.helios.useBehavior(id, params.options ?? true);
+        return serializeBehavior(behavior);
+      },
+      'behaviors.detach': async (params) => {
+        const id = params.id ?? params.behavior;
+        const detached = this.helios.behaviors?.detach?.(id) === true;
+        this.helios.requestRender?.();
+        return { detached, behaviors: getBehaviorState(this.helios) };
+      },
+      'behaviors.setEnabled': async (params) => setBehaviorEnabled(
+        this.helios,
+        params.id ?? params.behavior,
+        params.enabled,
+        params.options ?? {},
+      ),
+      'behaviors.update': async (params) => {
+        const id = params.id ?? params.behavior;
+        const behavior = this.helios.useBehavior(id, params.options ?? {});
+        this.helios.requestRender?.();
+        return serializeBehavior(behavior);
+      },
+      'behaviors.restore': async (params) => {
+        this.helios.restoreBehaviorState(params.snapshot ?? params);
+        this.helios.requestRender?.();
+        return getBehaviorState(this.helios);
+      },
+      'behaviors.call': async (params) => invokeBehavior(this.helios, params),
+      'positions.get': async () => getPositionSourceState(this.helios),
+      'positions.snapshot': async (params) => snapshotPositions(this.helios, params),
+      'positions.set': async (params) => setCustomPositions(this.helios, params),
+      'positions.fromAttribute': async (params) => applyPositionsFromAttribute(this.helios, params),
       'filters.get': async () => cloneJsonSafe(this.helios.getGraphFilter()),
       'filters.set': async (params) => {
         this.helios.setGraphFilter(params);

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createJsonLineParser, JsonRpcResponseReader, callJsonRpc } from './protocol/jsonl.js';
 import { ensureClientBundle, ensureStateDirs } from './shared/fs.js';
 import { createSessionId } from './shared/sessionId.js';
-import { listSessionMetas, loadSessionMeta } from './shared/sessionRegistry.js';
+import { listSessionMetas, loadSessionMeta, loadSessionState } from './shared/sessionRegistry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -162,6 +162,13 @@ async function sessionInfo(sessionId) {
   process.stdout.write(`${JSON.stringify(meta, null, 2)}\n`);
 }
 
+async function sessionState(sessionId) {
+  if (!sessionId) throw new Error('Usage: helios session state <sessionId>');
+  const state = await loadSessionState(sessionId);
+  if (!state) throw new Error(`No saved session state for ${sessionId}`);
+  process.stdout.write(`${JSON.stringify(state, null, 2)}\n`);
+}
+
 async function stopSession(sessionId) {
   const result = await rpcCall(sessionId, 'session.stop', {});
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -225,6 +232,7 @@ export async function runCli(argv) {
   if (command === 'session' && subcommand === 'start') return startSession(rest);
   if (command === 'session' && subcommand === 'list') return listSessions();
   if (command === 'session' && subcommand === 'info') return sessionInfo(rest[0]);
+  if (command === 'session' && subcommand === 'state') return sessionState(rest[0]);
   if (command === 'session' && subcommand === 'stop') return stopSession(rest[0]);
   if (command === 'session' && subcommand === 'attach') return attachSession(rest);
   if (command === 'call') return callMethod([subcommand, ...rest]);
@@ -235,6 +243,7 @@ export async function runCli(argv) {
     + '  helios session start [--mode headed|headless|server] [--open] [--renderer auto|webgl|webgpu] [--layout <name>] [--network <path>] [--no-gpu]\n'
     + '  helios session list\n'
     + '  helios session info <sessionId>\n'
+    + '  helios session state <sessionId>\n'
     + '  helios session stop <sessionId>\n'
     + '  helios session attach <sessionId> --stdio\n'
     + '  helios call <sessionId> <method> [--json <payload>]\n'

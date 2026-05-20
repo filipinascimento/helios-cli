@@ -9,11 +9,16 @@ export const packageRoot = path.resolve(__dirname, '..', '..');
 export const clientDistDir = path.join(packageRoot, 'dist', 'client');
 export const stateRoot = path.join(os.homedir(), '.helios-cli');
 export const sessionsDir = path.join(stateRoot, 'sessions');
+export const sessionStateDir = path.join(stateRoot, 'session-state');
 export const socketsDir = path.join(stateRoot, 'sockets');
 export const logsDir = path.join(stateRoot, 'logs');
 
 export function sessionMetaPath(sessionId) {
   return path.join(sessionsDir, `${sessionId}.json`);
+}
+
+export function sessionStatePath(sessionId) {
+  return path.join(sessionStateDir, `${sessionId}.json`);
 }
 
 export function sessionSocketPath(sessionId) {

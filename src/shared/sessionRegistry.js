@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ensureStateDirs, readJsonFile, writeJsonFile } from './fs.js';
-import { sessionMetaPath, sessionsDir } from './paths.js';
+import { sessionMetaPath, sessionStatePath, sessionsDir } from './paths.js';
 
 export async function loadSessionMeta(sessionId) {
   return readJsonFile(sessionMetaPath(sessionId), null);
@@ -16,6 +16,24 @@ export async function saveSessionMeta(sessionId, value) {
 export async function deleteSessionMeta(sessionId) {
   try {
     await fs.unlink(sessionMetaPath(sessionId));
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+export async function loadSessionState(sessionId) {
+  return readJsonFile(sessionStatePath(sessionId), null);
+}
+
+export async function saveSessionState(sessionId, value) {
+  await ensureStateDirs();
+  await writeJsonFile(sessionStatePath(sessionId), value);
+  return value;
+}
+
+export async function deleteSessionState(sessionId) {
+  try {
+    await fs.unlink(sessionStatePath(sessionId));
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }

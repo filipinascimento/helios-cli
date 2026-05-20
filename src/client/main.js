@@ -22,32 +22,6 @@ function publishRuntimeState(helios) {
   };
 }
 
-function installHoverInteractions(helios) {
-  helios
-    .resetStateStyles()
-    .nodeStateStyle('HIGHLIGHTED', {
-      sizeMul: 1.15,
-      opacityMul: 1.0,
-      outlineMul: 1.2,
-      colorAdd: [0.0, 0.25, 0.25, 0.0],
-    });
-
-  let highlightedNode = null;
-  helios.on(EVENTS.NODE_HOVER, (event) => {
-    const detail = event?.detail;
-    if (!detail) return;
-    if (detail.state === 'in' && Number.isInteger(detail.index) && detail.index >= 0) {
-      highlightedNode = detail.index;
-      helios.hoverNodeState(detail.index, 'HIGHLIGHTED');
-      return;
-    }
-    if (detail.state === 'out' && highlightedNode === detail.index) {
-      highlightedNode = null;
-      helios.hoverNodeState(null, 0);
-    }
-  });
-}
-
 function normalizeLayoutKey(value, fallback = 'gpu-force') {
   const normalized = String(value ?? fallback).trim().toLowerCase();
   if (normalized === 'static' || normalized === 'none') return 'static';
@@ -492,6 +466,35 @@ function invokeBehavior(helios, params = {}) {
   };
 }
 
+function persistenceScopeForRpc(method, params = {}) {
+  switch (method) {
+    case 'behaviors.use':
+    case 'behaviors.update':
+    case 'behaviors.setEnabled':
+    case 'behaviors.detach':
+    case 'behaviors.call':
+      return params.id ?? params.behavior ?? null;
+    case 'layout.set':
+    case 'layout.setParameters':
+    case 'layout.applyPositionAttribute':
+    case 'layout.start':
+    case 'layout.stop':
+      return 'layout';
+    case 'mappers.set':
+    case 'mappers.reset':
+      return 'mappers';
+    case 'scene.setMode':
+    case 'camera.setPose':
+    case 'camera.transition':
+    case 'camera.frame':
+    case 'camera.controls':
+    case 'camera.targetNodes':
+      return ['camera', 'cameraControls'];
+    default:
+      return null;
+  }
+}
+
 function getPositionSourceState(helios) {
   const raw = helios.positions?.() ?? null;
   const delegate = raw?.delegate ?? null;
@@ -592,9 +595,16 @@ function setCustomPositions(helios, params = {}) {
 }
 
 function getSceneState(helios) {
+  const graphLayer = helios.renderer?.graphLayer ?? null;
   return {
     mode: helios.mode(),
     renderer: helios.renderer?.device?.type ?? null,
+    rendererState: graphLayer ? {
+      propagateHoveredNodeToEdges: graphLayer.propagateHoveredNodeToEdges === true,
+      propagateSelectedNodesToEdges: graphLayer.propagateSelectedNodesToEdges === true,
+      nodeNoStateStyleEnabled: graphLayer.nodeNoStateStyleEnabled === true,
+      edgeNoStateStyleEnabled: graphLayer.edgeNoStateStyleEnabled === true,
+    } : null,
     size: cloneJsonSafe(helios.size ?? helios.layers?.size ?? null),
     network: getNetworkStats(helios),
     camera: cloneJsonSafe(helios.cameraPose?.() ?? null),
@@ -622,11 +632,26 @@ function createCliPersistence({ helios, config }) {
   let saveTimer = null;
   let pendingSave = Promise.resolve(null);
 
+  const currentSession = helios.persistence?.persistenceStatus?.();
+  if (!currentSession?.sessionId) {
+    helios.persistence?.configureSession?.({
+      id: persistenceId,
+      autosave: true,
+      restore: false,
+      saveInitialManifest: false,
+      networkPersistence: { enabled: true, format: 'bxnet' },
+    });
+  }
+
   const saveVisualizationFallback = () => {
-    const envelope = helios.serializeVisualizationState?.();
+    const envelope = helios.serializeTrackedVisualizationState?.({
+      layoutRuntime: { includePositions: false },
+    }) ?? helios.serializeVisualizationState?.({
+      layoutRuntime: { includePositions: false },
+    });
     const payload = {
       kind: 'helios-cli-visualization',
-      version: 1,
+      version: 2,
       sessionId,
       mode: helios.mode?.() ?? null,
       savedAt: Date.now(),
@@ -641,6 +666,7 @@ function createCliPersistence({ helios, config }) {
     const fallback = saveVisualizationFallback();
     try {
       if (options.fullSession === false || typeof helios.persistence?.saveSession !== 'function') {
+        await helios.persistence?.flush?.({ includeNetwork: false, snapshotLayoutRuntime: false });
         return { storage: 'localStorage', id: persistenceId, fallback };
       }
       const envelope = await helios.persistence.saveSession({
@@ -649,6 +675,7 @@ function createCliPersistence({ helios, config }) {
         status: 'active',
         networkFormat: options.networkFormat ?? 'bxnet',
       });
+      await helios.persistence?.flush?.({ includeNetwork: false, snapshotLayoutRuntime: false });
       return {
         storage: 'indexedDB+localStorage',
         id: envelope?.id ?? persistenceId,
@@ -700,10 +727,18 @@ function createCliPersistence({ helios, config }) {
     restoreInProgress = true;
     try {
       if (typeof helios.persistence?.restoreSession === 'function') {
+        if (options.preserveSparseState === true && typeof helios.persistence?.getSession === 'function') {
+          const storedSession = await helios.persistence.getSession(persistenceId);
+          if (!storedSession) {
+            if (options.skipFallback) return null;
+            return await restoreFallback(options);
+          }
+        }
         const restored = await helios.persistence.restoreSession(persistenceId, {
           markFinished: false,
           disposeOld: true,
           recreateRenderer: true,
+          restoreVisualizationState: options.preserveSparseState === true ? false : options.restoreVisualizationState,
           reason: options.reason ?? 'cli-session-restore',
         });
         if (restored) {
@@ -714,8 +749,13 @@ function createCliPersistence({ helios, config }) {
           };
         }
       }
+      if (options.skipFallback) return null;
       return await restoreFallback(options);
     } catch (error) {
+      if (options.skipFallback) {
+        console.warn('Helios CLI persisted session restore failed; localStorage visual fallback skipped', error);
+        return null;
+      }
       console.warn('Helios CLI persisted session restore failed, trying localStorage fallback', error);
       return await restoreFallback(options);
     } finally {
@@ -742,7 +782,7 @@ function createCliPersistence({ helios, config }) {
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
-      pendingSave = save({ fullSession: true });
+      pendingSave = save({ fullSession: false });
     }
     return pendingSave;
   };
@@ -757,6 +797,16 @@ function createCliPersistence({ helios, config }) {
     flush,
     isRestoring: () => restoreInProgress,
   };
+}
+
+async function waitForSessionBaselineIdle() {
+  if (typeof requestAnimationFrame !== 'function') {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return;
+  }
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  await new Promise((resolve) => setTimeout(resolve, 150));
 }
 
 function buildMapper(mode, network, descriptor) {
@@ -935,6 +985,7 @@ class BrowserBridge {
     this.handlers = this.buildHandlers();
     this.unsubscribers = [];
     this.bindEvents();
+    setTimeout(() => this.snapshotPersistenceState('bridge-ready'), 0);
   }
 
   bindEvents() {
@@ -955,7 +1006,7 @@ class BrowserBridge {
     on(EVENTS.CAMERA_MOVE, 'helios.cameraMove');
 
     if (this.persistence) {
-      const schedule = () => this.persistence.scheduleSave({ fullSession: true, delayMs: 750 });
+      const schedule = () => this.persistence.scheduleSave({ fullSession: false, delayMs: 750 });
       for (const behavior of this.helios.behaviors?.values?.() ?? []) {
         if (typeof behavior?.on === 'function') this.unsubscribers.push(behavior.on('change', schedule));
       }
@@ -973,6 +1024,31 @@ class BrowserBridge {
     this.socket.send(JSON.stringify({ jsonrpc: '2.0', method, params }));
   }
 
+  snapshotPersistenceState(reason = 'snapshot') {
+    const status = this.helios.persistence?.persistenceStatus?.() ?? null;
+    const overrides = this.helios.persistence?.getOverrides?.() ?? {};
+    const dirtyState = this.helios.persistence?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} };
+    const journal = this.helios.persistence?.getChangeJournal?.({ sinceCheckpoint: false }) ?? [];
+    this.notify('bridge.event', {
+      type: 'persistence.snapshot',
+      detail: {
+        reason,
+        persistenceId: this.persistence?.id ?? status?.sessionId ?? null,
+        storage: {
+          browser: 'localStorage+IndexedDB',
+          cli: 'filesystem',
+        },
+        status,
+        overrides,
+        dirtyState,
+        journal,
+        checkpointSeq: status?.checkpointSeq ?? 0,
+        networkData: status?.networkData ?? null,
+        savedAt: Date.now(),
+      },
+    });
+  }
+
   async handleMessage(raw) {
     const message = JSON.parse(String(raw));
     if (!message?.method) return;
@@ -986,9 +1062,33 @@ class BrowserBridge {
       return;
     }
     try {
-      const result = await handler(message.params ?? {});
-      if (this.persistence && MUTATING_METHODS.has(message.method)) {
-        await this.persistence.save({ fullSession: true });
+      const mutates = MUTATING_METHODS.has(message.method);
+      const before = mutates ? this.helios.serializeVisualizationState?.() : null;
+      const execute = () => handler(message.params ?? {});
+      const result = mutates && typeof this.helios.persistence?.runWithSessionSource === 'function'
+        ? await this.helios.persistence.runWithSessionSource('cli', execute)
+        : await execute();
+      if (mutates) {
+        const persistenceScope = persistenceScopeForRpc(message.method, message.params ?? {});
+        this.helios.persistence?.recordSessionChange?.({
+          before,
+          after: this.helios.serializeVisualizationState?.(),
+          source: 'cli',
+          method: message.method,
+          reason: 'cli-rpc',
+          scope: persistenceScope,
+        });
+        if (
+          message.method === 'network.attributeSet'
+          || message.method === 'network.loadPayload'
+          || message.method === 'network.replace'
+        ) {
+          this.helios.persistence?.sessionController?.markNetworkDirty?.(message.method);
+        }
+      }
+      if (this.persistence && mutates) {
+        await this.persistence.save({ fullSession: false });
+        this.snapshotPersistenceState(message.method);
       }
       this.socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id ?? null, result }));
     } catch (error) {
@@ -1008,12 +1108,54 @@ class BrowserBridge {
         storageKey: this.persistence?.storageKey ?? null,
         available: Boolean(this.persistence),
       }),
-      'persistence.save': async (params) => this.persistence?.save({
-        fullSession: params.fullSession !== false,
-        networkFormat: params.networkFormat ?? 'bxnet',
-      }) ?? { saved: false },
-      'persistence.restore': async (params) => this.persistence?.restore(params) ?? { restored: false },
-      'persistence.clear': async () => this.persistence?.clear() ?? { cleared: false },
+      'persistence.save': async (params) => {
+        const result = await (this.persistence?.save({
+          fullSession: params.fullSession !== false,
+          networkFormat: params.networkFormat ?? 'bxnet',
+        }) ?? { saved: false });
+        this.snapshotPersistenceState('persistence.save');
+        return result;
+      },
+      'persistence.restore': async (params) => {
+        const result = await (this.persistence?.restore(params) ?? { restored: false });
+        this.snapshotPersistenceState('persistence.restore');
+        return result;
+      },
+      'persistence.clear': async () => {
+        const result = await (this.persistence?.clear() ?? { cleared: false });
+        this.snapshotPersistenceState('persistence.clear');
+        return result;
+      },
+      'persistence.changes': async (params) => this.helios.persistence?.getChangeJournal?.({
+        since: params.since,
+        limit: params.limit,
+        source: params.source,
+        sinceCheckpoint: params.sinceCheckpoint !== false,
+      }) ?? [],
+      'persistence.checkpoint': async (params) => {
+        const result = this.helios.persistence?.checkpoint?.(params.seq ?? null) ?? { checkpointSeq: 0 };
+        this.snapshotPersistenceState('persistence.checkpoint');
+        return result;
+      },
+      'persistence.overrides': async () => ({
+        overrides: this.helios.persistence?.getOverrides?.() ?? {},
+        dirtyState: this.helios.persistence?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} },
+      }),
+      'persistence.reset': async (params) => {
+        const result = await (this.helios.persistence?.resetOverride?.(params.path ?? params.scope) ?? { reset: false });
+        this.snapshotPersistenceState('persistence.reset');
+        return result;
+      },
+      'persistence.flush': async (params) => {
+        const result = await (this.helios.persistence?.flush?.({
+          includeNetwork: params.includeNetwork === true,
+          snapshotLayoutRuntime: params.snapshotLayoutRuntime !== false,
+          network: params.network ?? {},
+        }) ?? null);
+        this.snapshotPersistenceState('persistence.flush');
+        return result;
+      },
+      'persistence.status': async () => this.helios.persistence?.persistenceStatus?.() ?? null,
       'network.stats': async () => getNetworkStats(this.helios),
       'network.attributeSet': async (params) => {
         writeNetworkAttribute(this.helios.network, params);
@@ -1054,7 +1196,11 @@ class BrowserBridge {
       },
       'network.savePayload': async (params) => {
         const format = params.format ?? 'bxnet';
-        const blob = await this.helios.saveNetwork(format, { output: 'blob' });
+        const blob = await this.helios.savePortableNetwork(format, {
+          output: 'blob',
+          includeVisualization: params.includeVisualization === true,
+          trackedOnly: params.trackedOnly === true,
+        });
         return {
           format,
           mimeType: blob.type || 'application/octet-stream',
@@ -1222,33 +1368,64 @@ async function bootstrap() {
     projection: 'perspective',
     layout: buildLayoutOptions({ network, mode: () => config.mode }, config.layout),
     renderer: resolveRendererPreference(config.renderer) ?? undefined,
+    session: {
+      id: cliPersistenceId(config.sessionId ?? new URLSearchParams(window.location.search).get('sessionId') ?? 'unknown'),
+      restore: true,
+      saveInitialManifest: true,
+      networkPersistence: { enabled: true, format: 'bxnet' },
+    },
   });
   await helios.ready;
   const ui = new HeliosUI({ helios, theme: 'dark', allowDrag: true });
+  window.__helios = helios;
+  window.__heliosUI = ui;
   publishRuntimeState(helios);
   helios.on?.(EVENTS.MODE_CHANGED, () => publishRuntimeState(helios));
-  ui.createDemoPanel();
-  ui.createMappersPanel({ dock: 'top-right', position: { x: 16, y: 16 } });
-  ui.createLayoutPanel({ dock: 'top-right', position: { x: 16, y: 360 } });
-  ui.createLegendsPanel({ dock: 'top-right', position: { x: 16, y: 560 } });
-  ui.createFilterPanel({ dock: 'top-right' });
-  ui.createCameraPanel({ dock: 'top-right' });
-  helios.enableAttributeTracking('$index', '$index', {
-    resolutionScale: 1,
-    trackDepth: true,
-    autoUpdate: true,
-    autoUpdateMaxFps: 60,
-  });
-  helios.enableNodePicking?.({ resolutionScale: 1, trackDepth: true, maxFps: 60 });
-  helios.enableEdgePicking?.({ resolutionScale: 1, trackDepth: true, maxFps: 60 });
-  installHoverInteractions(helios);
+  const buildCliInterface = () => {
+    ui.createDemoPanel();
+    ui.createMetricsPanel();
+    ui.createMappersPanel({ dock: 'top-right', position: { x: 16, y: 16 } });
+    ui.createLayoutPanel({ dock: 'top-right', position: { x: 16, y: 360 } });
+    ui.createLegendsPanel({ dock: 'top-right', position: { x: 16, y: 560 } });
+    ui.createFilterPanel({ dock: 'top-right' });
+    ui.createCameraPanel({ dock: 'top-right' });
+    ui.createSelectionPanel({ dock: 'top-right' });
+    helios.enableAttributeTracking('$index', '$index', {
+      resolutionScale: 1,
+      trackDepth: true,
+      autoUpdate: true,
+      autoUpdateMaxFps: 60,
+    });
+  };
+  const sessionController = helios.persistence?.sessionController ?? null;
+  if (sessionController?.suspendDuring) {
+    await sessionController.suspendDuring(async () => {
+      buildCliInterface();
+      await waitForSessionBaselineIdle();
+      if (!helios._sessionRestoreResult) {
+        if (typeof sessionController.resetTrackingBaseline === 'function') {
+          sessionController.resetTrackingBaseline(null, { clearJournal: true });
+        } else {
+          sessionController.captureBaseline?.();
+        }
+      }
+    });
+  } else {
+    buildCliInterface();
+  }
   const persistence = createCliPersistence({ helios, config });
   window.__HELIOS_CLI_PERSISTENCE__ = persistence;
-  const restored = await persistence.restore({ reason: 'page-load' });
+  const restored = await persistence.restore({
+    reason: 'page-load',
+    preserveSparseState: Boolean(helios._sessionRestoreResult),
+    skipFallback: Boolean(helios._sessionRestoreResult),
+  }) ?? (helios._sessionRestoreResult
+    ? { storage: 'browser-session', id: helios.persistence?.persistenceStatus?.()?.sessionId ?? null }
+    : null);
   if (restored) {
     console.info('Helios CLI restored persisted session state', restored);
   } else {
-    await persistence.save({ fullSession: true });
+    await persistence.save({ fullSession: false });
   }
   window.addEventListener('beforeunload', () => {
     try {

@@ -5,11 +5,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { loadSessionMeta } from '../src/shared/sessionRegistry.js';
+import { loadSessionMeta, loadSessionState } from '../src/shared/sessionRegistry.js';
 
 const execFileAsync = promisify(execFile);
 const cliPath = path.resolve('./bin/helios.js');
 const cliCwd = path.resolve('.');
+
+async function waitForSessionState(sessionId, predicate, { timeoutMs = 5000 } = {}) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const state = await loadSessionState(sessionId);
+    if (state && (!predicate || predicate(state))) return state;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
 
 async function runCli(args, options = {}) {
   const { stdout, stderr } = await execFileAsync(process.execPath, [cliPath, ...args], {
@@ -170,6 +180,40 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
       '--json',
       '{"id":"appearance","options":{"shaded":{"enabled":true,"nodes":true},"ambientOcclusion":{"enabled":true,"nodes":true}}}',
     ]);
+
+    const changesResult = await runCli([
+      'call',
+      session.sessionId,
+      'persistence.changes',
+      '--json',
+      '{"source":"cli","sinceCheckpoint":false}',
+    ]);
+    const changes = JSON.parse(changesResult.stdout);
+    assert.ok(changes.some((entry) => entry.source === 'cli' && entry.path === 'appearance.shaded.enabled'));
+    assert.ok(changes.some((entry) => entry.source === 'cli' && entry.path === 'appearance.ambientOcclusion.enabled'));
+
+    const overridesResult = await runCli(['call', session.sessionId, 'persistence.overrides']);
+    const overrides = JSON.parse(overridesResult.stdout);
+    assert.equal(overrides.overrides['appearance.shaded.enabled'], true);
+    assert.equal(overrides.overrides['appearance.ambientOcclusion.enabled'], true);
+
+    const checkpointResult = await runCli(['call', session.sessionId, 'persistence.checkpoint']);
+    const checkpoint = JSON.parse(checkpointResult.stdout);
+    assert.ok(checkpoint.checkpointSeq > 0);
+    const hiddenChangesResult = await runCli(['call', session.sessionId, 'persistence.changes']);
+    const hiddenChanges = JSON.parse(hiddenChangesResult.stdout);
+    assert.deepEqual(hiddenChanges, []);
+
+    const mirroredState = await waitForSessionState(
+      session.sessionId,
+      (state) => state.checkpointSeq === checkpoint.checkpointSeq
+        && state.overrides?.['appearance.shaded.enabled'] === true,
+    );
+    assert.ok(mirroredState);
+    assert.equal(mirroredState.persistenceId, `helios-cli:${session.sessionId}`);
+    assert.equal(mirroredState.storage.cli, 'filesystem');
+    assert.equal(mirroredState.status.overrideCount >= 1, true);
+
     const savedResult = await runCli([
       'call',
       session.sessionId,

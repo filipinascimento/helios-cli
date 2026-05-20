@@ -7,8 +7,13 @@ import { chromium } from 'playwright';
 import { WebSocketServer } from 'ws';
 import { createJsonLineParser, encodeMessage } from '../protocol/jsonl.js';
 import { ensureClientBundle, ensureStateDirs } from '../shared/fs.js';
-import { clientDistDir, sessionSocketPath } from '../shared/paths.js';
-import { deleteSessionMeta, saveSessionMeta } from '../shared/sessionRegistry.js';
+import { clientDistDir, sessionSocketPath, sessionStatePath } from '../shared/paths.js';
+import {
+  deleteSessionMeta,
+  loadSessionState,
+  saveSessionMeta,
+  saveSessionState,
+} from '../shared/sessionRegistry.js';
 
 function inferFormatFromPath(filePath, fallback = 'bxnet') {
   const extension = path.extname(String(filePath ?? '')).toLowerCase();
@@ -245,6 +250,7 @@ export class SessionDaemon {
       noGpu: this.config.noGpu === true,
       url: this.sessionUrl(),
       controlSocket: this.socketPath,
+      sessionStatePath: sessionStatePath(this.sessionId),
       httpPort: this.httpPort ?? null,
       bridgeConnected: this.bridgeReady,
       gpu: extra.gpu ?? this.gpu ?? null,
@@ -252,6 +258,7 @@ export class SessionDaemon {
       createdAt: this.metadata?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       lastError: extra.lastError ?? this.metadata?.lastError ?? null,
+      persistence: extra.persistence ?? this.metadata?.persistence ?? null,
     };
   }
 
@@ -363,8 +370,48 @@ export class SessionDaemon {
       return;
     }
     if (message?.method === 'bridge.event') {
-      this.emitEvent(message.params?.type ?? 'bridge.event', message.params?.detail ?? {});
+      const type = message.params?.type ?? 'bridge.event';
+      const detail = message.params?.detail ?? {};
+      if (type === 'persistence.snapshot') {
+        this.updateSessionState(detail).catch((error) => {
+          this.emitEvent('session.warning', { message: error?.message ?? String(error) });
+        });
+      }
+      this.emitEvent(type, detail);
     }
+  }
+
+  async updateSessionState(detail = {}) {
+    const previous = await loadSessionState(this.sessionId);
+    const state = {
+      kind: 'helios-cli-session-state',
+      version: 1,
+      sessionId: this.sessionId,
+      persistenceId: detail.persistenceId ?? previous?.persistenceId ?? `helios-cli:${this.sessionId}`,
+      storage: detail.storage ?? previous?.storage ?? null,
+      status: detail.status ?? previous?.status ?? null,
+      overrides: detail.overrides ?? previous?.overrides ?? {},
+      dirtyState: detail.dirtyState ?? previous?.dirtyState ?? { controls: {}, sections: {}, panels: {} },
+      journal: Array.isArray(detail.journal) ? detail.journal : (previous?.journal ?? []),
+      checkpointSeq: Number.isFinite(detail.checkpointSeq)
+        ? Number(detail.checkpointSeq)
+        : (previous?.checkpointSeq ?? 0),
+      networkData: detail.networkData ?? previous?.networkData ?? null,
+      savedAt: detail.savedAt ?? previous?.savedAt ?? null,
+      updatedAt: new Date().toISOString(),
+    };
+    await saveSessionState(this.sessionId, state);
+    await this.updateMetadata({
+      persistence: {
+        statePath: sessionStatePath(this.sessionId),
+        overrideCount: state.status?.overrideCount ?? Object.keys(state.overrides ?? {}).length,
+        journalCount: state.status?.journalCount ?? state.journal.length,
+        checkpointSeq: state.checkpointSeq,
+        networkData: state.networkData ?? null,
+        updatedAt: state.updatedAt,
+      },
+    });
+    return state;
   }
 
   async startControlServer() {
@@ -424,6 +471,8 @@ export class SessionDaemon {
     switch (method) {
       case 'session.getInfo':
         return this.buildMetadata();
+      case 'session.getStateFile':
+        return await loadSessionState(this.sessionId);
       case 'session.stop':
         setTimeout(() => {
           this.stop().catch(() => {});

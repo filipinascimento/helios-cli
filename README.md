@@ -22,7 +22,7 @@ npm link
 
 The package intentionally uses `file:../helios-network-v2` and `file:../helios-web-next` so CLI sessions run against the current local Helios Network and Helios Web source. The Vite build uses `../helios-web-next/src/index.js` when it exists.
 
-CLI browser sessions automatically checkpoint network and visualization state by session id. A page reload restores the saved network, camera, mode, layout, mappers, behaviors, filters, density, labels, and legends when possible.
+CLI browser sessions persist sparse session overrides by session id and can optionally checkpoint network data. The browser remains the source of truth for web reloads through localStorage/IndexedDB, and the CLI mirrors sparse status, overrides, and the journal to `~/.helios-cli/session-state/<sessionId>.json` for agent inspection. A page reload restores saved camera, mode, layout, mappers, behaviors, filters, density, labels, legends, and the network when a full network checkpoint exists.
 
 ## Basic Usage
 
@@ -30,8 +30,11 @@ CLI browser sessions automatically checkpoint network and visualization state by
 helios version
 helios session start --mode headless --renderer webgpu
 helios session list
+helios session state <sessionId>
 helios call <sessionId> scene.getState
 helios call <sessionId> camera.frame --json '{"animate":true,"durationMs":500}'
+helios call <sessionId> persistence.changes
+helios call <sessionId> persistence.checkpoint
 helios call <sessionId> persistence.save --json '{"fullSession":true}'
 helios call <sessionId> browser.reload
 helios call <sessionId> export.figure --json '{"format":"png","preset":"window","outputPath":"./figure.png"}'
@@ -52,6 +55,7 @@ Supported network extensions are `.bxnet`, `.zxnet`, and `.xnet`.
 - `helios session start` starts a session and prints session metadata as JSON.
 - `helios session list` lists known sessions from `~/.helios-cli/sessions`.
 - `helios session info <sessionId>` prints one session's daemon metadata.
+- `helios session state <sessionId>` prints the CLI-mirrored sparse session state from `~/.helios-cli/session-state`.
 - `helios session stop <sessionId>` stops a daemon and removes its metadata.
 - `helios call <sessionId> <method> [--json <payload>]` calls a JSON-RPC method.
 - `helios events <sessionId>` streams session events as newline-delimited JSON.
@@ -66,6 +70,12 @@ Supported network extensions are `.bxnet`, `.zxnet`, and `.xnet`.
 - `persistence.save`
 - `persistence.restore`
 - `persistence.clear`
+- `persistence.changes`
+- `persistence.checkpoint`
+- `persistence.overrides`
+- `persistence.reset`
+- `persistence.flush`
+- `persistence.status`
 - `browser.reload`
 - `network.stats`
 - `network.load`

@@ -1,6 +1,6 @@
 {
   "name": "helios-cli",
-  "version": "0.0.1",
+  "version": "0.10.0",
   "description": "Agent-friendly CLI for running and controlling Helios Web sessions.",
   "private": false,
   "type": "module",
@@ -26,10 +26,10 @@
     "vite.config.js"
   ],
   "dependencies": {
-    "helios-network": "file:../helios-network-v2",
-    "helios-web-next": "file:../helios-web-next",
+    "helios-network": "^0.10.0",
     "playwright": "^1.56.1",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "helios-web": "^0.10.0"
   },
   "devDependencies": {
     "vite": "^5.4.10"

@@ -1,18 +1,30 @@
+<p align="center">
+  <img src="./media/helios-web-logo.svg" alt="Helios" width="320">
+</p>
+
 # Helios CLI
 
-Agent-friendly CLI for starting and controlling Helios Web sessions backed by the current `helios-web-next` and `helios-network` packages.
+Agent-friendly CLI for starting and controlling Helios Web sessions backed by the current `helios-web` and `helios-network` packages.
 
 The CLI starts a small local session daemon, serves a Helios Web client, opens the OS/default browser for normal interactive sessions, launches Playwright-managed browsers only when explicitly requested, and exposes JSON-RPC methods for scene, network, camera, layout, mapper, filter, label, legend, density, picking, and export workflows.
 
 ## Install
 
-Clone the CLI next to the current Helios repos:
+Install the published CLI:
+
+```sh
+npm install -g helios-cli
+helios browser install
+helios version
+```
+
+For source checkout development, clone the packages next to each other:
 
 ```sh
 mkdir -p helios-new
 cd helios-new
 git clone git@github.com:filipinascimento/helios-network.git helios-network-v2
-git clone git@github.com:filipinascimento/helios-web-next.git helios-web-next
+git clone git@github.com:filipinascimento/helios-web.git helios-web
 git clone git@github.com:filipinascimento/helios-cli.git
 cd helios-cli
 npm install
@@ -20,9 +32,11 @@ npm run build
 npm link
 ```
 
-The package intentionally uses `file:../helios-network-v2` and `file:../helios-web-next` so CLI sessions run against the current local Helios Network and Helios Web source. The Vite build uses `../helios-web-next/src/index.js` when it exists.
+The published package depends on `helios-network` and `helios-web`. Source
+checkout development can still alias the adjacent renderer source while building
+the CLI client.
 
-CLI browser sessions use the `helios-web-next` state machine and storage facade. CLI-origin changes should go through tracked state paths (`state.set` / `helios.states.set(..., { source: "cli" })`) so only explicit overrides are saved. Durable session storage is owned by the CLI daemon, not browser localStorage or IndexedDB: session JSON lives under `~/.helios/sessions`, network side records are saved as `.zxnet`/`.bxnet`/`.xnet`, position side records are saved as binary files, session thumbnails are stored as data URLs in the private session JSON payload, and runtime daemon metadata lives under `~/.helios/runtime`. Use global `--storage-dir <path>` or `HELIOS_CLI_STORAGE_DIR` to choose another root.
+CLI browser sessions use the `helios-web` state machine and storage facade. CLI-origin changes should go through tracked state paths (`state.set` / `helios.states.set(..., { source: "cli" })`) so only explicit overrides are saved. Durable session storage is owned by the CLI daemon, not browser localStorage or IndexedDB: session JSON lives under `~/.helios/sessions`, network side records are saved as `.zxnet`/`.bxnet`/`.xnet`, position side records are saved as binary files, session thumbnails are stored as data URLs in the private session JSON payload, and runtime daemon metadata lives under `~/.helios/runtime`. Use global `--storage-dir <path>` or `HELIOS_CLI_STORAGE_DIR` to choose another root.
 
 ## Basic Usage
 
@@ -69,7 +83,7 @@ This installs Playwright's bundled Chromium. Use `helios browser install --with-
 
 ## Commands
 
-- `helios version` prints CLI, `helios-network`, and `helios-web-next` versions visible to the current install.
+- `helios version` prints CLI, `helios-network`, and `helios-web` versions visible to the current install.
 - `helios browser install [browser...] [--with-deps]` installs Playwright browser binaries for managed sessions. It defaults to `chromium`.
 - `helios config get` prints the CLI config path and stored config.
 - `helios config set desktop.appPath <path>` records the Helios Desktop app path for `--surface desktop`.
@@ -80,14 +94,14 @@ This installs Playwright's bundled Chromium. Use `helios browser install --with-
 - `helios session info <sessionId>` prints one session's daemon metadata.
 - `helios session state <sessionId>` prints the CLI-mirrored sparse session state from `~/.helios/runtime/session-state`.
 - `helios session stop <sessionId>` stops a daemon and removes its metadata.
-- `helios state get <sessionId> [path]` reads the Web Next tracked state snapshot or one state path.
+- `helios state get <sessionId> [path]` reads the Helios Web tracked state snapshot or one state path.
 - `helios state set <sessionId> <path> <json-value> [--scope user|workspace|network|session]` writes through `helios.states` with `source: "cli"` and persists the sparse override.
 - `helios state reset <sessionId> <path>` resets a tracked path/prefix to default and removes the override.
 - `helios call <sessionId> <method> [--json <payload>]` calls a JSON-RPC method.
 - `helios events <sessionId>` streams session events as newline-delimited JSON.
 - `helios session attach <sessionId> --stdio` bridges JSON-RPC over stdio.
 
-Full session saves capture a PNG thumbnail by default and store it in the session JSON payload used by the session list UI. Lightweight autosaves request thumbnail capture with the Web Next `auto` policy, so thumbnail refreshes are throttled while the user is actively interacting. Pass `"captureThumbnail": false` to `persistence.save` or `persistence.flush` to keep an existing thumbnail, or pass a custom `"thumbnail"` object with a `dataUrl` when an external preview should be stored.
+Full session saves capture a PNG thumbnail by default and store it in the session JSON payload used by the session list UI. Lightweight autosaves request thumbnail capture with the Helios Web `auto` policy, so thumbnail refreshes are throttled while the user is actively interacting. Pass `"captureThumbnail": false` to `persistence.save` or `persistence.flush` to keep an existing thumbnail, or pass a custom `"thumbnail"` object with a `dataUrl` when an external preview should be stored.
 
 ## Common RPC Methods
 

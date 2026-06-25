@@ -4,23 +4,41 @@ Use this skill when an agent needs to create, inspect, render, manipulate, or ex
 
 ## Install
 
-Clone the CLI next to the current Helios repos:
+Check that Node.js is available before using the CLI:
 
 ```sh
-mkdir -p helios-new
-cd helios-new
-git clone git@github.com:filipinascimento/helios-network.git helios-network-v2
-git clone git@github.com:filipinascimento/helios-web-next.git helios-web-next
-git clone git@github.com:filipinascimento/helios-cli.git
-cd helios-cli
-npm install
-node bin/helios.js browser install
-npm run build
-npm link
+node --version
+npm --version
+```
+
+If `node` or `npm` is missing, install Node.js 18 or newer first. On macOS with Homebrew:
+
+```sh
+brew install node
+```
+
+On Linux, use the distribution package manager or NodeSource packages. On Windows, install the current LTS build from the official Node.js installer.
+
+Install the published CLI and its managed browser:
+
+```sh
+npm install -g helios-cli
+helios browser install
 helios version
 ```
 
-The CLI intentionally depends on `file:../helios-network-v2` and `file:../helios-web-next`. Keep the three repositories adjacent so agents use the current local Helios Network and Helios Web source rather than older published packages.
+Use `helios browser install --with-deps` on Linux when Playwright reports missing system dependencies.
+
+To install this skill for Codex, copy the `skills/helios-cli` directory into the local Codex skills directory:
+
+```sh
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/helios-cli "${CODEX_HOME:-$HOME/.codex}/skills/helios-cli"
+```
+
+To install this skill for Claude, copy the same `skills/helios-cli` directory into the Claude skills location used by your Claude client or project. The skill is plain Markdown plus reference files, so it does not require Codex-specific tooling.
+
+For source checkout development, clone `helios-network`, `helios-web`, and `helios-cli` next to each other, run `npm install`, `npm run build`, and `npm link` inside `helios-cli`. The published package depends on `helios-network` and `helios-web`; source checkouts can still alias adjacent local sources during development.
 
 ## Basic Usage
 
@@ -65,7 +83,7 @@ helios session start --network ./graph.bxnet
 2. Use plain `session start` for human visual inspection in the OS/default browser; use `--mode headless` for automated rendering/export. Reserve explicit `--mode headed` for Playwright-managed debugging.
 3. Capture the JSON session metadata from `session start`; all subsequent calls need `sessionId`.
 4. Use `scene.getState` before changes and after changes to confirm renderer, network counts, layout state, mapper state, labels, legends, density, filters, and camera state.
-5. Prefer `helios state set/get/reset` or the `state.*` RPC methods for tracked Web Next parameters. These calls flow through `helios.states` and are saved by `helios.storage`.
+5. Prefer `helios state set/get/reset` or the `state.*` RPC methods for tracked Helios Web parameters. These calls flow through `helios.states` and are saved by `helios.storage`.
 6. Use `persistence.save` before intentional reloads or handoff points when the current visual state matters. Full saves capture a session thumbnail by default; pass `{"captureThumbnail":false}` only when preserving an older preview is intentional.
 7. Stop sessions with `helios session stop <sessionId>` when finished.
 

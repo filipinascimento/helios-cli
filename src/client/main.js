@@ -7,11 +7,12 @@ function wsUrlForCurrentLocation() {
 }
 
 function cliPersistenceId(sessionId) {
-  return `helios-cli:${sessionId}`;
+  return String(sessionId ?? 'unknown');
 }
 
-function cliVisualizationStorageKey(sessionId) {
-  return `helios-cli:visualization:${sessionId}`;
+function isDesktopRuntime(config = {}) {
+  const runtime = String(config.runtime ?? new URLSearchParams(window.location.search).get('runtime') ?? '').toLowerCase();
+  return runtime === 'desktop' || runtime === 'mac';
 }
 
 function publishRuntimeState(helios) {
@@ -29,6 +30,29 @@ function normalizeLayoutKey(value, fallback = 'gpu-force') {
   if (normalized === 'worker:jitter' || normalized === 'jitter') return 'worker:jitter';
   if (normalized === 'worker:force3d' || normalized === 'worker' || normalized === 'force3d') return 'worker:force3d';
   return 'gpu-force';
+}
+
+function readNetworkScalarAttribute(network, name) {
+  const info = network?.getNetworkAttributeInfo?.(name) ?? null;
+  if (!info || Number(info.dimension ?? 1) !== 1) return undefined;
+  if (Number(info.type) === AttributeType.String || Number(info.type) === AttributeType.Category) {
+    return network.getNetworkStringAttribute?.(name);
+  }
+  let value;
+  const read = () => {
+    value = network.getNetworkAttributeBuffer?.(name)?.view?.[0];
+  };
+  if (typeof network.withBufferAccess === 'function') network.withBufferAccess(read);
+  else read();
+  return value;
+}
+
+function networkHasUmapForceMetadata(network) {
+  const value = readNetworkScalarAttribute(network, 'umap');
+  if (typeof value === 'string') {
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+  }
+  return Number(value) !== 0 && Number.isFinite(Number(value));
 }
 
 function resolveRendererPreference(value) {
@@ -171,7 +195,17 @@ function applyLayoutParameters(helios, params = {}) {
       throw new Error(`Layout parameter "${key}" is read-only`);
     }
     const value = normalizeBindingValue(binding, rawValue);
-    binding.set(value);
+    const statePath = `layout.parameters.${key}`;
+    if (typeof helios.states?.entry === 'function' && helios.states.entry(statePath)) {
+      helios.states.set(statePath, value, {
+        source: 'cli',
+        reason: params.reason ?? 'layout.setParameters',
+        scope: params.scope ?? 'network',
+        trackOverride: params.trackOverride !== false,
+      });
+    } else {
+      binding.set(value);
+    }
     changed[key] = typeof binding.get === 'function' ? cloneJsonSafe(binding.get()) : value;
   }
   if (params.start === true) helios.startLayout?.();
@@ -238,30 +272,37 @@ function buildLayoutOptions(helios, key) {
   }
   return {
     type: 'gpu-force',
-    options: {
-      mode,
-      center: [0, 0, 0],
-      radius,
-      depth,
-      outputScale: 6.5,
-      linkDistance: 1,
-      kRepulsion: 0.07,
-      kAttraction: 0.62,
-      kGravity: 0.005,
-      eta: 0.4,
-      damping: 0.92,
-      maxStep: 2.5,
-      minDistance: 0.15,
-    },
+    options: networkHasUmapForceMetadata(helios.network)
+      ? {
+          mode,
+          center: [0, 0, 0],
+          radius,
+          depth,
+        }
+      : {
+          mode,
+          center: [0, 0, 0],
+          radius,
+          depth,
+          outputScale: 6.5,
+          linkDistance: 1,
+          kRepulsion: 0.07,
+          kAttraction: 0.62,
+          kGravity: 0.005,
+          eta: 0.4,
+          damping: 0.92,
+          maxStep: 2.5,
+          minDistance: 0.15,
+        },
   };
 }
 
-function seedGridPositions(network, nodeCount, mode) {
+function seedGridPositions(network, nodeCount, mode, options = {}) {
   network.defineNodeAttribute('_helios_visuals_position', AttributeType.Float, 3);
   network.withBufferAccess(() => {
     const pos = network.getNodeAttributeBuffer('_helios_visuals_position').view;
     if (mode === '3d') {
-      const side = Math.ceil(Math.cbrt(nodeCount));
+      const side = clampInteger(options.side, Math.ceil(Math.cbrt(nodeCount)), 1);
       const spacing = 24;
       for (let i = 0; i < nodeCount; i += 1) {
         const z = Math.floor(i / (side * side));
@@ -269,19 +310,20 @@ function seedGridPositions(network, nodeCount, mode) {
         const y = Math.floor(rem / side);
         const x = rem - y * side;
         const offset = i * 3;
-        pos[offset] = (x - side / 2) * spacing;
-        pos[offset + 1] = (y - side / 2) * spacing;
-        pos[offset + 2] = (z - side / 2) * spacing;
+        pos[offset] = (x - (side - 1) / 2) * spacing;
+        pos[offset + 1] = (y - (side - 1) / 2) * spacing;
+        pos[offset + 2] = (z - (side - 1) / 2) * spacing;
       }
     } else {
-      const side = Math.ceil(Math.sqrt(nodeCount));
+      const columns = clampInteger(options.columns, Math.ceil(Math.sqrt(nodeCount)), 1);
+      const rows = clampInteger(options.rows, Math.ceil(nodeCount / columns), 1);
       const spacing = 24;
       for (let i = 0; i < nodeCount; i += 1) {
-        const row = Math.floor(i / side);
-        const col = i - row * side;
+        const row = Math.floor(i / columns);
+        const col = i - row * columns;
         const offset = i * 3;
-        pos[offset] = (col - side / 2) * spacing;
-        pos[offset + 1] = (row - side / 2) * spacing;
+        pos[offset] = (col - (columns - 1) / 2) * spacing;
+        pos[offset + 1] = (row - (rows - 1) / 2) * spacing;
         pos[offset + 2] = 0;
       }
     }
@@ -300,6 +342,289 @@ function seedRandomPositions(network, nodeCount, mode) {
       pos[offset + 2] = (Math.random() - 0.5) * depth;
     }
   });
+}
+
+function seedPositionsFromGenerator(network, nodeCount) {
+  if (!network.hasNodeAttribute?.('_helios_generator_position')) return false;
+  network.defineNodeAttribute('_helios_visuals_position', AttributeType.Float, 3);
+  network.withBufferAccess(() => {
+    const source = network.getNodeAttributeBuffer('_helios_generator_position').view;
+    const pos = network.getNodeAttributeBuffer('_helios_visuals_position').view;
+    for (let i = 0; i < nodeCount; i += 1) {
+      pos[i * 3] = (source[i * 2] - 0.5) * 400;
+      pos[(i * 3) + 1] = (source[(i * 2) + 1] - 0.5) * 400;
+      pos[(i * 3) + 2] = 0;
+    }
+  });
+  return true;
+}
+
+function clampInteger(value, fallback, min = 1, max = 1_000_000) {
+  const numeric = Number(value);
+  const fallbackNumeric = Number(fallback);
+  const candidate = Number.isFinite(numeric) ? numeric : fallbackNumeric;
+  return Math.min(max, Math.max(min, Math.floor(Number.isFinite(candidate) ? candidate : min)));
+}
+
+function clampNumber(value, fallback, min = -Infinity, max = Infinity) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function decorateSyntheticNetwork(network, options = {}) {
+  const nodeCount = network.nodeCount ?? 0;
+  const edgeCount = network.edgeCount ?? 0;
+  const labelNodes = nodeCount <= 50_000;
+  network.defineNodeAttribute('_helios_visuals_size', AttributeType.Float, 1);
+  network.defineNodeAttribute('_helios_visuals_color', AttributeType.Float, 4);
+  network.defineEdgeAttribute('_helios_visuals_edge_color', AttributeType.Float, 8);
+  network.defineEdgeAttribute('_helios_visuals_edge_width', AttributeType.Float, 2);
+  network.defineNodeAttribute('weight', AttributeType.Float, 1);
+  network.defineEdgeAttribute('intensity', AttributeType.Float, 1);
+  if (labelNodes) {
+    network.defineNodeAttribute('label', AttributeType.String, 1);
+    network.defineNodeAttribute('category', AttributeType.String, 1);
+  }
+  network.withBufferAccess(() => {
+    const nodeIds = network.nodeIndices;
+    const edgeIds = network.edgeIndices;
+    const size = network.getNodeAttributeBuffer('_helios_visuals_size').view;
+    const color = network.getNodeAttributeBuffer('_helios_visuals_color').view;
+    const edgeColor = network.getEdgeAttributeBuffer('_helios_visuals_edge_color').view;
+    const edgeWidth = network.getEdgeAttributeBuffer('_helios_visuals_edge_width').view;
+    const weight = network.getNodeAttributeBuffer('weight').view;
+    const intensity = network.getEdgeAttributeBuffer('intensity').view;
+    for (let ordinal = 0; ordinal < nodeIds.length; ordinal += 1) {
+      const id = nodeIds[ordinal];
+      const ratio = ordinal / Math.max(1, nodeIds.length - 1);
+      size[id] = options.nodeSize ?? 9;
+      weight[id] = ratio;
+      const hue = (ordinal * 37) % 360;
+      const phase = hue / 60;
+      const x = 1 - Math.abs((phase % 2) - 1);
+      const palette = phase < 1 ? [1, x, 0]
+        : phase < 2 ? [x, 1, 0]
+          : phase < 3 ? [0, 1, x]
+            : phase < 4 ? [0, x, 1]
+              : phase < 5 ? [x, 0, 1]
+                : [1, 0, x];
+      color.set([
+        palette[0] * 0.55 + 0.25,
+        palette[1] * 0.55 + 0.25,
+        palette[2] * 0.55 + 0.25,
+        1,
+      ], id * 4);
+    }
+    for (let ordinal = 0; ordinal < edgeIds.length; ordinal += 1) {
+      const edgeId = edgeIds[ordinal];
+      const value = ordinal / Math.max(1, edgeCount - 1);
+      intensity[edgeId] = value;
+      edgeColor.set([0.16, 0.28, 0.42, 0.42, 0.16, 0.28, 0.42, 0.42], edgeId * 8);
+      edgeWidth[edgeId * 2] = options.edgeWidth ?? 1.2;
+      edgeWidth[(edgeId * 2) + 1] = options.edgeWidth ?? 1.2;
+    }
+  }, { nodeIndices: true, edgeIndices: true });
+  if (labelNodes) {
+    let nodes = [];
+    network.withBufferAccess(() => {
+      nodes = Uint32Array.from(network.nodeIndices);
+    }, { nodeIndices: true });
+    const categoryCount = 8;
+    for (let ordinal = 0; ordinal < nodes.length; ordinal += 1) {
+      const id = nodes[ordinal];
+      const bucket = Math.min(categoryCount - 1, Math.floor((ordinal / Math.max(1, nodes.length)) * categoryCount));
+      network.setNodeStringAttribute('label', id, `node-${ordinal}`);
+      network.setNodeStringAttribute('category', id, `category${bucket + 1}`);
+    }
+    network.categorizeNodeAttribute?.('category', { sortOrder: 'frequency' });
+  }
+  const layout = normalizeLayoutKey(options.layout ?? 'static');
+  if (layout === 'static') {
+    if (!seedPositionsFromGenerator(network, nodeCount)) {
+      seedGridPositions(network, nodeCount, options.mode ?? '2d', options);
+    }
+  } else {
+    seedRandomPositions(network, nodeCount, options.mode ?? '2d');
+  }
+  return network;
+}
+
+async function createGrid2DNetwork(options = {}) {
+  const columns = clampInteger(options.columns, 50);
+  const rows = clampInteger(options.rows, 50);
+  const neighborLevel = clampInteger(options.neighborLevel, 1, 1, 64);
+  const periodic = options.periodic === true;
+  const network = await HeliosNetwork.generateLattice2D({
+    rows,
+    columns,
+    neighborLevel,
+    periodic,
+    directed: options.directed === true,
+  });
+  return decorateSyntheticNetwork(network, {
+    ...options,
+    rows,
+    columns,
+    nodeCount: rows * columns,
+    mode: '2d',
+    layout: options.layout ?? 'static',
+  });
+}
+
+async function createGrid3DNetwork(options = {}) {
+  const requestedNodeCount = clampInteger(options.nodeCount, 4096);
+  const side = clampInteger(options.side, Math.ceil(Math.cbrt(requestedNodeCount)));
+  const nodeCount = Math.min(requestedNodeCount, side ** 3);
+  const neighborLevel = clampInteger(options.neighborLevel, 1, 1, 64);
+  const periodic = options.periodic === true;
+  const edgeCountEstimate = nodeCount * 3 * neighborLevel;
+  const network = await HeliosNetwork.create({
+    directed: false,
+    initialNodes: nodeCount,
+    initialEdges: edgeCountEstimate,
+  });
+  const edges = new Uint32Array(edgeCountEstimate * 2);
+  let edgeOffset = 0;
+  const indexAt = (x, y, z) => z * side * side + y * side + x;
+  const pushEdge = (from, x, y, z) => {
+    let nx = x;
+    let ny = y;
+    let nz = z;
+    if (periodic) {
+      nx = (nx + side) % side;
+      ny = (ny + side) % side;
+      nz = (nz + side) % side;
+    }
+    if (nx < 0 || nx >= side || ny < 0 || ny >= side || nz < 0 || nz >= side) return;
+    const to = indexAt(nx, ny, nz);
+    if (to >= nodeCount || to === from) return;
+    edges[edgeOffset] = from;
+    edges[edgeOffset + 1] = to;
+    edgeOffset += 2;
+  };
+  for (let z = 0; z < side; z += 1) {
+    for (let y = 0; y < side; y += 1) {
+      for (let x = 0; x < side; x += 1) {
+        const from = indexAt(x, y, z);
+        if (from >= nodeCount) break;
+        for (let level = 1; level <= neighborLevel; level += 1) {
+          pushEdge(from, x + level, y, z);
+          pushEdge(from, x, y + level, z);
+          pushEdge(from, x, y, z + level);
+        }
+      }
+    }
+  }
+  if (edgeOffset > 0) network.addEdges(edges.subarray(0, edgeOffset));
+  return decorateSyntheticNetwork(network, {
+    ...options,
+    side,
+    nodeCount,
+    mode: '3d',
+    layout: options.layout ?? 'static',
+  });
+}
+
+async function createSmallWorldNetwork(options = {}) {
+  const nodeCount = clampInteger(options.nodeCount, 1000);
+  const neighborLevel = clampInteger(options.neighborLevel, 2, 1, Math.max(1, Math.floor(nodeCount / 2)));
+  const rewiringProbability = clampNumber(options.rewiringProbability, 0.01, 0, 1);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const network = await HeliosNetwork.generateWattsStrogatz({
+    nodeCount,
+    neighborLevel,
+    rewiringProbability,
+    seed,
+    directed: options.directed === true,
+  });
+  return decorateSyntheticNetwork(network, { ...options, mode: options.mode ?? '2d', layout: options.layout ?? 'gpu-force' });
+}
+
+async function createBarabasiAlbertNetwork(options = {}) {
+  const nodeCount = clampInteger(options.nodeCount, 1000);
+  const edgesPerNewNode = clampInteger(options.edgesPerNewNode, 2, 1, Math.max(1, nodeCount - 1));
+  const initialCliqueSize = clampInteger(options.initialCliqueSize, edgesPerNewNode + 1, 2, nodeCount);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const network = await HeliosNetwork.generateBarabasiAlbert({
+    nodeCount,
+    edgesPerNewNode,
+    initialCliqueSize,
+    directed: options.directed === true,
+    seed,
+  });
+  return decorateSyntheticNetwork(network, { ...options, mode: options.mode ?? '2d', layout: options.layout ?? 'gpu-force' });
+}
+
+async function createRandomGeometricNetwork(options = {}) {
+  const nodeCount = clampInteger(options.nodeCount, 1000, 1, 100_000);
+  const radius = clampNumber(options.radius, 0.05, 0, 1);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const network = await HeliosNetwork.generateRandomGeometric({
+    nodeCount,
+    radius,
+    directed: options.directed === true,
+    seed,
+  });
+  return decorateSyntheticNetwork(network, { ...options, mode: options.mode ?? '2d', layout: options.layout ?? 'static' });
+}
+
+async function createWaxmanNetwork(options = {}) {
+  const nodeCount = clampInteger(options.nodeCount, 1000, 1, 100_000);
+  const alpha = clampNumber(options.alpha, 0.4, 0.001, 10);
+  const beta = clampNumber(options.beta, 0.2, 0, 1);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const network = await HeliosNetwork.generateWaxman({
+    nodeCount,
+    alpha,
+    beta,
+    directed: options.directed === true,
+    seed,
+  });
+  return decorateSyntheticNetwork(network, { ...options, mode: options.mode ?? '2d', layout: options.layout ?? 'static' });
+}
+
+async function createStochasticBlockNetwork(options = {}) {
+  const blockCount = clampInteger(options.blockCount, 4, 1, 64);
+  const blockSize = clampInteger(options.blockSize, 50, 1, 20_000);
+  const intraProbability = clampNumber(options.intraProbability, 0.08, 0, 1);
+  const interProbability = clampNumber(options.interProbability, 0.01, 0, 1);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const blockSizes = Array.from({ length: blockCount }, () => blockSize);
+  const probabilities = Array.from({ length: blockCount }, (_, row) => (
+    Array.from({ length: blockCount }, (_, column) => (row === column ? intraProbability : interProbability))
+  ));
+  const network = await HeliosNetwork.generateStochasticBlockModel({
+    blockSizes,
+    probabilities,
+    directed: options.directed === true,
+    seed,
+  });
+  return decorateSyntheticNetwork(network, {
+    ...options,
+    nodeCount: blockCount * blockSize,
+    mode: options.mode ?? '2d',
+    layout: options.layout ?? 'gpu-force',
+  });
+}
+
+async function createConfigurationModelNetwork(options = {}) {
+  const nodeCount = clampInteger(options.nodeCount, 500, 1, 200_000);
+  const maxDegree = options.allowSelfLoops === true || options.allowMultiEdges === true ? 10_000 : Math.max(0, nodeCount - 1);
+  const degree = clampInteger(options.degree, 4, 0, maxDegree);
+  const seed = clampInteger(options.seed, 1, 1, 0x7fffffff);
+  const degrees = Array.from({ length: nodeCount }, () => degree);
+  if ((degree * nodeCount) % 2 !== 0) {
+    degrees[nodeCount - 1] = Math.max(0, degree - 1);
+  }
+  const network = await HeliosNetwork.generateConfigurationModel({
+    degrees,
+    directed: options.directed === true,
+    allowSelfLoops: options.allowSelfLoops === true,
+    allowMultiEdges: options.allowMultiEdges !== false,
+    seed,
+  });
+  return decorateSyntheticNetwork(network, { ...options, mode: options.mode ?? '2d', layout: options.layout ?? 'gpu-force' });
 }
 
 async function createSeedNetwork({ nodeCount = 200, mode = '2d', layout = 'gpu-force' } = {}) {
@@ -346,6 +671,23 @@ async function createSeedNetwork({ nodeCount = 200, mode = '2d', layout = 'gpu-f
   return network;
 }
 
+async function createSyntheticNetwork(options = {}) {
+  const model = String(options.model ?? options.name ?? 'ring').trim().toLowerCase();
+  if (['grid', 'grid2d', 'lattice', 'lattice2d'].includes(model)) return createGrid2DNetwork(options);
+  if (['grid3d', 'lattice3d'].includes(model)) return createGrid3DNetwork(options);
+  if (['sw', 'small-world', 'smallworld', 'watts-strogatz', 'watts_strogatz'].includes(model)) return createSmallWorldNetwork(options);
+  if (['ba', 'barabasi-albert', 'barabasi_albert', 'preferential-attachment'].includes(model)) return createBarabasiAlbertNetwork(options);
+  if (['random-geometric', 'random_geometric', 'geometric'].includes(model)) return createRandomGeometricNetwork(options);
+  if (model === 'waxman') return createWaxmanNetwork(options);
+  if (['sbm', 'stochastic-block', 'stochastic_block', 'stochastic-block-model'].includes(model)) return createStochasticBlockNetwork(options);
+  if (['configuration', 'configuration-model', 'configuration_model'].includes(model)) return createConfigurationModelNetwork(options);
+  return createSeedNetwork({
+    nodeCount: clampInteger(options.nodeCount, 200),
+    mode: options.mode ?? '2d',
+    layout: options.layout ?? 'gpu-force',
+  });
+}
+
 async function blobToBase64(blob) {
   const buffer = await blob.arrayBuffer();
   let binary = '';
@@ -366,13 +708,125 @@ function fileFromBase64({ name, base64, mimeType = 'application/octet-stream' })
   return new File([bytes], name, { type: mimeType });
 }
 
+function encodeBinaryForJson(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const bytes = value instanceof ArrayBuffer
+      ? new Uint8Array(value)
+      : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+    return {
+      __heliosBinary: 'base64',
+      type: value.constructor?.name ?? 'Uint8Array',
+      byteLength: bytes.byteLength,
+      data: btoa(binary),
+    };
+  }
+  if (Array.isArray(value)) return value.map((entry) => encodeBinaryForJson(entry));
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) out[key] = encodeBinaryForJson(entry);
+  return out;
+}
+
+function decodeBinaryFromJson(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value;
+  if (value.__heliosBinary === 'base64') return base64ToUint8Array(value.data ?? '');
+  if (Array.isArray(value)) return value.map((entry) => decodeBinaryFromJson(entry));
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) out[key] = decodeBinaryFromJson(entry);
+  return out;
+}
+
+class CliStorageClient {
+  constructor({ baseUrl = '' } = {}) {
+    this.baseUrl = baseUrl;
+  }
+
+  async request(path, options = {}) {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      ...options,
+      headers: {
+        ...(options.body ? { 'content-type': 'application/json' } : {}),
+        ...(options.headers ?? {}),
+      },
+    });
+    const payload = decodeBinaryFromJson(await response.json().catch(() => null));
+    if (!response.ok) {
+      throw new Error(payload?.error ?? `CLI storage request failed with HTTP ${response.status}`);
+    }
+    return payload;
+  }
+
+  putSession(record) {
+    return this.request('/api/storage/session', {
+      method: 'POST',
+      body: JSON.stringify(encodeBinaryForJson(record)),
+    });
+  }
+
+  getSession(id) {
+    return this.request(`/api/storage/session/${encodeURIComponent(String(id))}`)
+      .catch((error) => {
+        if (String(error?.message ?? '').includes('not-found')) return null;
+        throw error;
+      });
+  }
+
+  listSessions() {
+    return this.request('/api/storage/sessions');
+  }
+
+  deleteSession(id) {
+    return this.request(`/api/storage/session/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+      .then((result) => result.deleted === true);
+  }
+
+  getUnfinishedSessionId(workspaceId = null) {
+    const query = workspaceId == null ? '' : `?workspaceId=${encodeURIComponent(String(workspaceId))}`;
+    return this.request(`/api/storage/unfinished${query}`).then((result) => result.sessionId ?? null);
+  }
+
+  setUnfinishedSessionId(id, workspaceId = null) {
+    return this.request('/api/storage/unfinished', {
+      method: 'PUT',
+      body: JSON.stringify({ sessionId: id ?? null, workspaceId }),
+    }).then((result) => result.sessionId ?? null);
+  }
+}
+
 function getNetworkStats(helios) {
   const network = helios.network;
+  const typeNames = new Map(Object.entries(AttributeType).map(([name, value]) => [value, name]));
+  const serializeInfo = (name, info) => {
+    const type = info?.type ?? AttributeType.Unknown;
+    return {
+      name,
+      type,
+      typeName: typeNames.get(type) ?? `Unknown(${type})`,
+      dimension: Number(info?.dimension ?? 1),
+      complex: info?.complex === true,
+      categorical: type === AttributeType.Category || type === AttributeType.MultiCategory,
+      stringLike: type === AttributeType.String,
+    };
+  };
+  const inspectScope = (scope) => {
+    const names = network?.[`get${scope}AttributeNames`]?.() ?? [];
+    return names.map((name) => serializeInfo(name, network?.[`get${scope}AttributeInfo`]?.(name)));
+  };
   return {
     nodeCount: network?.nodeCount ?? 0,
     edgeCount: network?.edgeCount ?? 0,
+    directed: Boolean(network?.directed),
     nodeAttributes: network?.getNodeAttributeNames?.() ?? [],
     edgeAttributes: network?.getEdgeAttributeNames?.() ?? [],
+    networkAttributes: network?.getNetworkAttributeNames?.() ?? [],
+    attributes: {
+      node: inspectScope('Node'),
+      edge: inspectScope('Edge'),
+      network: inspectScope('Network'),
+    },
   };
 }
 
@@ -426,6 +880,43 @@ function findBehavior(helios, id) {
   return behavior;
 }
 
+function findOptionalBehavior(helios, id) {
+  return helios.getBehavior?.(id) ?? helios.behaviors?.get?.(id) ?? helios.behavior?.[id] ?? null;
+}
+
+function sanitizeFigureRpcOptions(params = {}) {
+  const {
+    outputPath,
+    useCurrentOptions,
+    current,
+    ...options
+  } = params && typeof params === 'object' ? params : {};
+  return options;
+}
+
+function resolveFigureRpcOptions(helios, params = {}) {
+  const exporter = findOptionalBehavior(helios, 'exporter');
+  const options = sanitizeFigureRpcOptions(params);
+  const useCurrentOptions = params.useCurrentOptions === true || params.current === true;
+  if (useCurrentOptions && typeof exporter?.getResolvedOptions === 'function') {
+    return exporter.getResolvedOptions(options);
+  }
+  if (typeof helios?._resolveFigureExportOptions === 'function') {
+    return helios._resolveFigureExportOptions(options);
+  }
+  return options;
+}
+
+async function exportFigureRpcBlob(helios, params = {}) {
+  const exporter = findOptionalBehavior(helios, 'exporter');
+  const options = sanitizeFigureRpcOptions(params);
+  const useCurrentOptions = params.useCurrentOptions === true || params.current === true;
+  if (useCurrentOptions && typeof exporter?.exportBlob === 'function') {
+    return exporter.exportBlob(options);
+  }
+  return helios.exportFigureBlob(resolveFigureRpcOptions(helios, params));
+}
+
 function setBehaviorEnabled(helios, id, enabled, options = {}) {
   const behavior = findBehavior(helios, id);
   const value = enabled !== false;
@@ -442,8 +933,100 @@ function setBehaviorEnabled(helios, id, enabled, options = {}) {
   } else {
     throw new Error(`Behavior "${id}" does not expose enabled state`);
   }
+  setRegisteredCliState(helios, [`${id}.enabled`, `behaviors.${id}.enabled`], value, {
+    reason: options.reason ?? 'behaviors.setEnabled',
+    scope: options.scope ?? 'session',
+    trackOverride: options.trackOverride,
+  });
   helios.requestRender?.();
   return serializeBehavior(helios.getBehavior?.(id) ?? helios.behaviors?.get?.(id) ?? behavior);
+}
+
+function flattenObjectLeaves(value, prefix = '') {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || ArrayBuffer.isView(value)) {
+    return prefix ? [[prefix, value]] : [];
+  }
+  const leaves = [];
+  for (const [key, entry] of Object.entries(value)) {
+    const next = prefix ? `${prefix}.${key}` : key;
+    if (entry && typeof entry === 'object' && !Array.isArray(entry) && !ArrayBuffer.isView(entry)) {
+      const childLeaves = flattenObjectLeaves(entry, next);
+      if (childLeaves.length > 0) leaves.push(...childLeaves);
+      else leaves.push([next, entry]);
+    } else {
+      leaves.push([next, entry]);
+    }
+  }
+  return leaves;
+}
+
+function setRegisteredCliState(helios, candidates, value, options = {}) {
+  for (const candidate of candidates) {
+    if (!candidate || !helios.states?.entry?.(candidate)) continue;
+    return helios.states.set(candidate, value, {
+      source: 'cli',
+      reason: options.reason ?? 'cli-rpc',
+      scope: options.scope ?? 'session',
+      trackOverride: options.trackOverride !== false,
+      applyBinding: options.applyBinding !== false,
+      debounceMs: options.debounceMs ?? 0,
+    });
+  }
+  return null;
+}
+
+function trackBehaviorOptionOverrides(helios, id, options = {}, detail = {}) {
+  const tracked = [];
+  for (const [path, value] of flattenObjectLeaves(options)) {
+    const result = setRegisteredCliState(helios, [
+      `${id}.${path}`,
+      `behaviors.${id}.${path}`,
+    ], value, {
+      reason: detail.reason ?? `behaviors.${id}`,
+      scope: detail.scope ?? 'session',
+      trackOverride: detail.trackOverride,
+      applyBinding: false,
+    });
+    if (result?.key) tracked.push(result.key);
+  }
+  return tracked;
+}
+
+function assignNested(target, path, value) {
+  const parts = String(path).split('.').filter(Boolean);
+  let cursor = target;
+  while (parts.length > 1) {
+    const part = parts.shift();
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) cursor[part] = {};
+    cursor = cursor[part];
+  }
+  if (parts.length === 1) cursor[parts[0]] = value;
+}
+
+function applyAppearanceOverridesFromState(helios, overrides = {}) {
+  const patch = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!key.startsWith('appearance.')) continue;
+    assignNested(patch, key.slice('appearance.'.length), value);
+  }
+  if (Object.keys(patch).length === 0) return null;
+  const behavior = helios.useBehavior?.('appearance', patch) ?? helios.behavior?.appearance;
+  if (behavior && typeof behavior.update === 'function') behavior.update(patch);
+  helios.requestRender?.();
+  return patch;
+}
+
+function reapplyRestoredStateBindings(helios, reason = 'cli-post-restore-bindings') {
+  const overrides = helios.states?.getOverrides?.({ aliases: false });
+  const preferredOverrides = helios.states?.getOverrides?.({ aliases: 'preferred' });
+  if (!overrides || typeof overrides !== 'object' || Object.keys(overrides).length === 0) return null;
+  const restored = helios.states?.restore?.(overrides, {
+    source: 'restore',
+    reason,
+    trackOverride: true,
+  });
+  applyAppearanceOverridesFromState(helios, preferredOverrides ?? {});
+  return restored;
 }
 
 function invokeBehavior(helios, params = {}) {
@@ -464,35 +1047,6 @@ function invokeBehavior(helios, params = {}) {
     result: result === behavior ? serializeBehavior(behavior) : cloneJsonSafe(result),
     behavior: serializeBehavior(behavior),
   };
-}
-
-function persistenceScopeForRpc(method, params = {}) {
-  switch (method) {
-    case 'behaviors.use':
-    case 'behaviors.update':
-    case 'behaviors.setEnabled':
-    case 'behaviors.detach':
-    case 'behaviors.call':
-      return params.id ?? params.behavior ?? null;
-    case 'layout.set':
-    case 'layout.setParameters':
-    case 'layout.applyPositionAttribute':
-    case 'layout.start':
-    case 'layout.stop':
-      return 'layout';
-    case 'mappers.set':
-    case 'mappers.reset':
-      return 'mappers';
-    case 'scene.setMode':
-    case 'camera.setPose':
-    case 'camera.transition':
-    case 'camera.frame':
-    case 'camera.controls':
-    case 'camera.targetNodes':
-      return ['camera', 'cameraControls'];
-    default:
-      return null;
-  }
 }
 
 function getPositionSourceState(helios) {
@@ -627,74 +1181,65 @@ function getSceneState(helios) {
 function createCliPersistence({ helios, config }) {
   const sessionId = config.sessionId ?? new URLSearchParams(window.location.search).get('sessionId') ?? 'unknown';
   const persistenceId = cliPersistenceId(sessionId);
-  const storageKey = cliVisualizationStorageKey(sessionId);
-  let restoreInProgress = false;
   let saveTimer = null;
   let pendingSave = Promise.resolve(null);
 
-  const currentSession = helios.persistence?.persistenceStatus?.();
-  if (!currentSession?.sessionId) {
-    helios.persistence?.configureSession?.({
-      id: persistenceId,
-      autosave: true,
-      restore: false,
-      saveInitialManifest: false,
-      networkPersistence: { enabled: true, format: 'bxnet' },
-    });
-  }
-
-  const saveVisualizationFallback = () => {
-    const envelope = helios.serializeTrackedVisualizationState?.({
-      layoutRuntime: { includePositions: false },
-    }) ?? helios.serializeVisualizationState?.({
-      layoutRuntime: { includePositions: false },
-    });
-    const payload = {
-      kind: 'helios-cli-visualization',
-      version: 2,
-      sessionId,
-      mode: helios.mode?.() ?? null,
-      savedAt: Date.now(),
-      visualizationState: envelope,
-    };
-    localStorage.setItem(storageKey, JSON.stringify(payload));
-    return payload;
-  };
-
   const save = async (options = {}) => {
-    if (restoreInProgress || options.enabled === false) return null;
-    const fallback = saveVisualizationFallback();
-    try {
-      if (options.fullSession === false || typeof helios.persistence?.saveSession !== 'function') {
-        await helios.persistence?.flush?.({ includeNetwork: false, snapshotLayoutRuntime: false });
-        return { storage: 'localStorage', id: persistenceId, fallback };
-      }
-      const envelope = await helios.persistence.saveSession({
-        id: persistenceId,
-        unfinished: true,
-        status: 'active',
-        networkFormat: options.networkFormat ?? 'bxnet',
-      });
-      await helios.persistence?.flush?.({ includeNetwork: false, snapshotLayoutRuntime: false });
-      return {
-        storage: 'indexedDB+localStorage',
-        id: envelope?.id ?? persistenceId,
-        updatedAt: envelope?.payload?.session?.updatedAt ?? null,
-        fallback,
-      };
-    } catch (error) {
-      console.warn('Helios CLI persistence save fell back to localStorage only', error);
-      return {
-        storage: 'localStorage',
-        id: persistenceId,
-        warning: error?.message ?? String(error),
-        fallback,
-      };
-    }
+    if (options.enabled === false) return null;
+    const storage = helios.storage;
+    if (!storage?.capabilities?.sessions) return { saved: false, id: persistenceId, reason: 'storage-unavailable' };
+    const includeNetwork = options.fullSession !== false && options.includeNetwork !== false;
+    const captureThumbnail = Object.hasOwn(options, 'captureThumbnail') && options.captureThumbnail !== undefined
+      ? options.captureThumbnail
+      : includeNetwork ? true : 'auto';
+    const envelope = await storage.flush({
+      id: persistenceId,
+      reason: options.reason ?? 'cli-save',
+      includeNetwork,
+      includePositions: options.includePositions === true || includeNetwork,
+      snapshotLayoutRuntime: options.snapshotLayoutRuntime === true,
+      networkFormat: options.networkFormat ?? 'zxnet',
+      captureThumbnail,
+      thumbnail: options.thumbnail ?? options.sessionThumbnail,
+      fullVisualizationState: options.fullVisualizationState === true,
+    });
+    const thumbnail = envelope?.payload?.thumbnail ?? null;
+    return {
+      storage: 'cli-filesystem',
+      id: envelope?.id ?? envelope?.payload?.session?.id ?? storage.sessionId ?? persistenceId,
+      updatedAt: envelope?.payload?.session?.updatedAt ?? Date.now(),
+      session: envelope?.payload?.session ?? null,
+      thumbnail: thumbnail ? {
+        type: thumbnail.type ?? null,
+        encoding: thumbnail.encoding ?? null,
+        width: thumbnail.width ?? null,
+        height: thumbnail.height ?? null,
+        byteLength: thumbnail.byteLength ?? null,
+        capturedAt: thumbnail.capturedAt ?? null,
+        dataUrl: Boolean(thumbnail.dataUrl),
+      } : null,
+      networkData: envelope?.payload?.networkData ? {
+        ...envelope.payload.networkData,
+        data: undefined,
+        byteLength: envelope.payload.networkData.byteLength
+          ?? envelope.payload.networkData.data?.byteLength
+          ?? null,
+      } : null,
+      positionData: envelope?.payload?.positionData ? {
+        ...envelope.payload.positionData,
+        data: undefined,
+        byteLength: envelope.payload.positionData.byteLength
+          ?? envelope.payload.positionData.data?.byteLength
+          ?? null,
+        storedByteLength: envelope.payload.positionData.storedByteLength
+          ?? envelope.payload.positionData.data?.byteLength
+          ?? null,
+      } : null,
+    };
   };
 
   const scheduleSave = (options = {}) => {
-    if (restoreInProgress || options.enabled === false) return pendingSave;
+    if (options.enabled === false) return pendingSave;
     const delay = Number.isFinite(options.delayMs) ? Math.max(0, Number(options.delayMs)) : 500;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
@@ -704,77 +1249,29 @@ function createCliPersistence({ helios, config }) {
     return pendingSave;
   };
 
-  const restoreFallback = async (options = {}) => {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return null;
-    const payload = JSON.parse(raw);
-    if (payload?.mode && payload.mode !== helios.mode?.()) {
-      await helios.setMode?.(payload.mode, options.modeOptions ?? {});
-    }
-    if (payload?.visualizationState) {
-      await helios.restoreVisualizationState?.(payload.visualizationState, {
-        reason: options.reason ?? 'cli-localStorage-restore',
-      });
-    }
-    return {
-      storage: 'localStorage',
-      id: persistenceId,
-      savedAt: payload?.savedAt ?? null,
-    };
-  };
-
   const restore = async (options = {}) => {
-    restoreInProgress = true;
-    try {
-      if (typeof helios.persistence?.restoreSession === 'function') {
-        if (options.preserveSparseState === true && typeof helios.persistence?.getSession === 'function') {
-          const storedSession = await helios.persistence.getSession(persistenceId);
-          if (!storedSession) {
-            if (options.skipFallback) return null;
-            return await restoreFallback(options);
-          }
-        }
-        const restored = await helios.persistence.restoreSession(persistenceId, {
-          markFinished: false,
-          disposeOld: true,
-          recreateRenderer: true,
-          restoreVisualizationState: options.preserveSparseState === true ? false : options.restoreVisualizationState,
-          reason: options.reason ?? 'cli-session-restore',
-        });
-        if (restored) {
-          return {
-            storage: 'indexedDB',
-            id: restored?.id ?? persistenceId,
-            updatedAt: restored?.payload?.session?.updatedAt ?? null,
-          };
-        }
-      }
-      if (options.skipFallback) return null;
-      return await restoreFallback(options);
-    } catch (error) {
-      if (options.skipFallback) {
-        console.warn('Helios CLI persisted session restore failed; localStorage visual fallback skipped', error);
-        return null;
-      }
-      console.warn('Helios CLI persisted session restore failed, trying localStorage fallback', error);
-      return await restoreFallback(options);
-    } finally {
-      restoreInProgress = false;
+    const restored = await helios.storage?.restoreSession?.(persistenceId, {
+      markFinished: false,
+      disposeOld: true,
+      recreateRenderer: true,
+      restoreVisualizationState: options.restoreVisualizationState,
+      reason: options.reason ?? 'cli-session-restore',
+    });
+    if (restored) {
       helios.requestRender?.();
+      return {
+        storage: 'cli-filesystem',
+        id: restored?.id ?? restored?.payload?.session?.id ?? persistenceId,
+        updatedAt: restored?.payload?.session?.updatedAt ?? null,
+      };
     }
+    return null;
   };
 
   const clear = async () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
-    localStorage.removeItem(storageKey);
-    if (typeof helios.persistence?.deleteSession === 'function') {
-      try {
-        await helios.persistence.deleteSession(persistenceId);
-      } catch (error) {
-        console.warn('Failed to clear Helios CLI persisted IndexedDB session', error);
-      }
-    }
+    await helios.storage?.deleteSession?.(persistenceId);
     return { cleared: true, id: persistenceId };
   };
 
@@ -789,13 +1286,12 @@ function createCliPersistence({ helios, config }) {
 
   return {
     id: persistenceId,
-    storageKey,
     save,
     scheduleSave,
     restore,
     clear,
     flush,
-    isRestoring: () => restoreInProgress,
+    isRestoring: () => false,
   };
 }
 
@@ -982,6 +1478,7 @@ class BrowserBridge {
     this.helios = helios;
     this.ui = ui;
     this.persistence = window.__HELIOS_CLI_PERSISTENCE__ ?? null;
+    this.checkpointSeq = 0;
     this.handlers = this.buildHandlers();
     this.unsubscribers = [];
     this.bindEvents();
@@ -1025,24 +1522,24 @@ class BrowserBridge {
   }
 
   snapshotPersistenceState(reason = 'snapshot') {
-    const status = this.helios.persistence?.persistenceStatus?.() ?? null;
-    const overrides = this.helios.persistence?.getOverrides?.() ?? {};
-    const dirtyState = this.helios.persistence?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} };
-    const journal = this.helios.persistence?.getChangeJournal?.({ sinceCheckpoint: false }) ?? [];
+    const status = this.helios.storage?.persistenceStatus?.() ?? null;
+    const overrides = this.helios.states?.getOverrides?.({ aliases: 'preferred' }) ?? {};
+    const dirtyState = this.helios.states?.dirtyState?.() ?? { controls: {}, sections: {}, panels: {} };
+    const journal = this.helios.states?.journal ?? [];
     this.notify('bridge.event', {
       type: 'persistence.snapshot',
       detail: {
         reason,
         persistenceId: this.persistence?.id ?? status?.sessionId ?? null,
         storage: {
-          browser: 'localStorage+IndexedDB',
           cli: 'filesystem',
         },
         status,
+        backendStatus: [],
         overrides,
         dirtyState,
         journal,
-        checkpointSeq: status?.checkpointSeq ?? 0,
+        checkpointSeq: this.checkpointSeq,
         networkData: status?.networkData ?? null,
         savedAt: Date.now(),
       },
@@ -1063,31 +1560,28 @@ class BrowserBridge {
     }
     try {
       const mutates = MUTATING_METHODS.has(message.method);
-      const before = mutates ? this.helios.serializeVisualizationState?.() : null;
       const execute = () => handler(message.params ?? {});
-      const result = mutates && typeof this.helios.persistence?.runWithSessionSource === 'function'
-        ? await this.helios.persistence.runWithSessionSource('cli', execute)
-        : await execute();
+      const result = await execute();
+      const networkMutation = message.method === 'network.attributeSet'
+        || message.method === 'network.loadPayload'
+        || message.method === 'network.replace';
+      const positionMutation = message.method === 'positions.set'
+        || message.method === 'positions.fromAttribute'
+        || message.method === 'layout.applyPositionAttribute';
       if (mutates) {
-        const persistenceScope = persistenceScopeForRpc(message.method, message.params ?? {});
-        this.helios.persistence?.recordSessionChange?.({
-          before,
-          after: this.helios.serializeVisualizationState?.(),
-          source: 'cli',
-          method: message.method,
-          reason: 'cli-rpc',
-          scope: persistenceScope,
-        });
-        if (
-          message.method === 'network.attributeSet'
-          || message.method === 'network.loadPayload'
-          || message.method === 'network.replace'
-        ) {
-          this.helios.persistence?.sessionController?.markNetworkDirty?.(message.method);
+        if (networkMutation) {
+          this.helios.storage?.markNetworkDirty?.(message.method);
+        }
+        if (positionMutation) {
+          this.helios.storage?.markPositionsDirty?.(message.method);
         }
       }
       if (this.persistence && mutates) {
-        await this.persistence.save({ fullSession: false });
+        await this.persistence.save({
+          fullSession: networkMutation,
+          includePositions: positionMutation,
+          reason: message.method,
+        });
         this.snapshotPersistenceState(message.method);
       }
       this.socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id ?? null, result }));
@@ -1101,17 +1595,100 @@ class BrowserBridge {
   }
 
   buildHandlers() {
+    const readPersistenceStatus = () => {
+      const status = this.helios.storage?.persistenceStatus?.() ?? null;
+      if (!status) return null;
+      const journal = this.helios.states?.journal ?? [];
+      const maxSeq = Math.max(0, ...journal.map((entry) => Number(entry.seq ?? 0)));
+      const dirtyByJournal = maxSeq > this.checkpointSeq;
+      const networkData = status.networkData ?? {};
+      return {
+        ...status,
+        backendStatus: [],
+        journalCount: maxSeq,
+        checkpointSeq: this.checkpointSeq,
+        hasUnsavedChanges: dirtyByJournal
+          || networkData.dirty === true
+          || networkData.positionsDirty === true
+          || status.sessionSync?.pending === true,
+      };
+    };
+    const stateJournal = (params = {}) => {
+      let entries = Array.isArray(this.helios.states?.journal) ? this.helios.states.journal : [];
+      if (params.sinceCheckpoint !== false) {
+        entries = entries.filter((entry) => Number(entry.seq ?? 0) > this.checkpointSeq);
+      }
+      if (params.since != null) {
+        entries = entries.filter((entry) => Number(entry.seq ?? 0) > Number(params.since));
+      }
+      if (params.source) entries = entries.filter((entry) => entry.source === params.source);
+      if (Number.isFinite(params.limit)) entries = entries.slice(-Math.max(0, Number(params.limit)));
+      const aliases = params.aliases ?? 'preferred';
+      return cloneJsonSafe(entries.map((entry) => {
+        if (!(aliases === true || aliases === 'preferred')) return entry;
+        const preferred = this.helios.states?.preferredKey?.(entry.key ?? entry.path);
+        if (!preferred || preferred === entry.path) return entry;
+        return { ...entry, canonicalPath: entry.path, path: preferred };
+      }));
+    };
     return {
       'session.getInfo': async () => getSceneState(this.helios),
+      'state.get': async (params) => {
+        const path = params.path ?? params.key ?? null;
+        if (!path) {
+          return {
+            snapshot: cloneJsonSafe(this.helios.states?.snapshot?.({ aliases: params.aliases ?? 'preferred', includeJournal: params.includeJournal === true }) ?? null),
+            status: readPersistenceStatus(),
+          };
+        }
+        return {
+          path,
+          value: cloneJsonSafe(this.helios.states?.get?.(path)),
+          status: cloneJsonSafe(this.helios.states?.status?.(path) ?? null),
+          entry: cloneJsonSafe(this.helios.states?.entry?.(path) ?? null),
+        };
+      },
+      'state.set': async (params) => {
+        const path = params.path ?? params.key;
+        if (!path) throw new Error('state.set requires params.path');
+        const result = this.helios.states?.set?.(path, params.value, {
+          source: 'cli',
+          reason: params.reason ?? 'cli-state-set',
+          scope: params.scope ?? 'session',
+          trackOverride: params.trackOverride !== false,
+          debounceMs: params.debounceMs ?? 0,
+        });
+        await this.persistence?.save?.({ fullSession: false, reason: params.reason ?? 'state.set' });
+        this.snapshotPersistenceState('state.set');
+        return {
+          result: cloneJsonSafe(result),
+          value: cloneJsonSafe(this.helios.states?.get?.(path)),
+          status: cloneJsonSafe(this.helios.states?.status?.(path) ?? null),
+        };
+      },
+      'state.reset': async (params) => {
+        const path = params.path ?? params.key ?? params.scope;
+        if (!path) throw new Error('state.reset requires params.path');
+        const result = this.helios.states?.reset?.(path, {
+          source: 'cli',
+          reason: params.reason ?? 'cli-state-reset',
+        });
+        await this.persistence?.save?.({ fullSession: false, reason: params.reason ?? 'state.reset' });
+        this.snapshotPersistenceState('state.reset');
+        return cloneJsonSafe(result);
+      },
       'persistence.get': async () => ({
         id: this.persistence?.id ?? null,
-        storageKey: this.persistence?.storageKey ?? null,
         available: Boolean(this.persistence),
+        status: readPersistenceStatus(),
+        backendStatus: [],
       }),
       'persistence.save': async (params) => {
         const result = await (this.persistence?.save({
           fullSession: params.fullSession !== false,
-          networkFormat: params.networkFormat ?? 'bxnet',
+          networkFormat: params.networkFormat ?? 'zxnet',
+          captureThumbnail: Object.hasOwn(params, 'captureThumbnail') ? params.captureThumbnail : undefined,
+          thumbnail: params.thumbnail ?? params.sessionThumbnail,
         }) ?? { saved: false });
         this.snapshotPersistenceState('persistence.save');
         return result;
@@ -1126,37 +1703,102 @@ class BrowserBridge {
         this.snapshotPersistenceState('persistence.clear');
         return result;
       },
-      'persistence.changes': async (params) => this.helios.persistence?.getChangeJournal?.({
-        since: params.since,
-        limit: params.limit,
-        source: params.source,
-        sinceCheckpoint: params.sinceCheckpoint !== false,
-      }) ?? [],
+      'persistence.changes': async (params) => stateJournal(params),
       'persistence.checkpoint': async (params) => {
-        const result = this.helios.persistence?.checkpoint?.(params.seq ?? null) ?? { checkpointSeq: 0 };
+        const maxSeq = Math.max(0, ...((this.helios.states?.journal ?? []).map((entry) => Number(entry.seq ?? 0))));
+        this.checkpointSeq = Number.isFinite(Number(params.seq)) ? Number(params.seq) : maxSeq;
+        const result = { checkpointSeq: this.checkpointSeq };
         this.snapshotPersistenceState('persistence.checkpoint');
         return result;
       },
       'persistence.overrides': async () => ({
-        overrides: this.helios.persistence?.getOverrides?.() ?? {},
-        dirtyState: this.helios.persistence?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} },
+        overrides: this.helios.states?.getOverrides?.({ aliases: 'preferred' }) ?? {},
+        dirtyState: this.helios.states?.dirtyState?.() ?? { controls: {}, sections: {}, panels: {} },
       }),
       'persistence.reset': async (params) => {
-        const result = await (this.helios.persistence?.resetOverride?.(params.path ?? params.scope) ?? { reset: false });
+        const result = this.helios.states?.reset?.(params.path ?? params.scope, {
+          source: 'cli',
+          reason: params.reason ?? 'persistence.reset',
+        }) ?? { reset: false };
+        await this.persistence?.save?.({ fullSession: false, reason: 'persistence.reset' });
         this.snapshotPersistenceState('persistence.reset');
         return result;
       },
       'persistence.flush': async (params) => {
-        const result = await (this.helios.persistence?.flush?.({
+        const result = await (this.helios.storage?.flush?.({
           includeNetwork: params.includeNetwork === true,
+          includePositions: params.includePositions === true,
           snapshotLayoutRuntime: params.snapshotLayoutRuntime !== false,
           network: params.network ?? {},
+          networkFormat: params.networkFormat ?? params.network?.format ?? 'zxnet',
+          captureThumbnail: params.captureThumbnail,
+          thumbnail: params.thumbnail ?? params.sessionThumbnail,
+          reason: params.reason ?? 'persistence.flush',
         }) ?? null);
         this.snapshotPersistenceState('persistence.flush');
         return result;
       },
-      'persistence.status': async () => this.helios.persistence?.persistenceStatus?.() ?? null,
+      'persistence.status': async () => readPersistenceStatus(),
+      'persistence.backendStatus': async () => [],
+      'persistence.exportDocumentState': async (params) => cloneJsonSafe(
+        await this.helios.storage?.serializeNetworkSnapshot?.({
+          reason: params.reason ?? 'desktop-document-save',
+          includeCurrentPositions: params.includeCurrentPositions !== false,
+          trackedOnly: params.trackedOnly !== false,
+          fullVisualizationState: params.fullVisualizationState === true,
+        }) ?? null,
+      ),
+      'persistence.restoreDocumentState': async (params) => {
+        const snapshot = params.visualizationState ?? params.snapshot ?? params;
+        if (!snapshot) return null;
+        if (this.helios.importVisualizationState) {
+          await this.helios.importVisualizationState(snapshot, {
+            restoreLayoutRunState: params.restoreLayoutRunState !== false,
+            hydratePersistence: false,
+            refreshPersistence: false,
+            source: 'restore',
+            reason: params.reason ?? 'desktop-document-restore',
+          });
+        } else if (snapshot?.payload?.storageState) {
+          this.helios.storage?.restoreSnapshot?.(snapshot.payload.storageState, {
+            source: 'restore',
+            reason: params.reason ?? 'desktop-document-restore',
+          });
+        }
+        reapplyRestoredStateBindings(this.helios, 'desktop-document-restore-bindings');
+        this.helios.requestRender?.();
+        this.snapshotPersistenceState('persistence.restoreDocumentState');
+        return { restored: true };
+      },
+      'persistence.documentSaved': async (params) => {
+        const storage = this.helios.storage ?? null;
+        const maxSeq = Math.max(0, ...((this.helios.states?.journal ?? []).map((entry) => Number(entry.seq ?? 0))));
+        this.checkpointSeq = maxSeq;
+        if (storage?.networkData) {
+          const savedAt = Date.now();
+          storage.sessionSavedAt = savedAt;
+          storage.sessionSaveError = null;
+          storage.networkData = {
+            ...storage.networkData,
+            enabled: true,
+            status: 'saved',
+            dirty: false,
+            positionsDirty: false,
+            dirtyAt: null,
+            savedAt,
+            format: params.format ?? storage.networkData.format ?? null,
+            documentPath: params.filePath ?? storage.networkData.documentPath ?? null,
+          };
+          storage._pendingStateOverrideDeltas?.clear?.();
+          storage.dispatchEvent?.(new CustomEvent('change', {
+            detail: { reason: params.reason ?? 'document-saved', status: storage.persistenceStatus?.() ?? null },
+          }));
+        }
+        this.snapshotPersistenceState(params.reason ?? 'persistence.documentSaved');
+        return readPersistenceStatus();
+      },
       'network.stats': async () => getNetworkStats(this.helios),
+      'network.inspect': async () => getNetworkStats(this.helios),
       'network.attributeSet': async (params) => {
         writeNetworkAttribute(this.helios.network, params);
         if (params.applyAsPositions === true || params.positionAttribute === true) {
@@ -1184,8 +1826,8 @@ class BrowserBridge {
           return this.handlers['network.loadPayload'](params);
         }
         if (params.synthetic) {
-          const network = await createSeedNetwork({
-            nodeCount: params.synthetic.nodeCount ?? 200,
+          const network = await createSyntheticNetwork({
+            ...params.synthetic,
             mode: params.synthetic.mode ?? this.helios.mode(),
             layout: params.synthetic.layout ?? identifyLayout(this.helios.layout()),
           });
@@ -1200,6 +1842,8 @@ class BrowserBridge {
           output: 'blob',
           includeVisualization: params.includeVisualization === true,
           trackedOnly: params.trackedOnly === true,
+          includeCurrentPositions: params.includeCurrentPositions === true,
+          fullVisualizationState: params.fullVisualizationState === true,
         });
         return {
           format,
@@ -1214,16 +1858,29 @@ class BrowserBridge {
         return getSceneState(this.helios);
       },
       'scene.setMode': async (params) => {
-        await this.helios.setMode(params.mode, params.options ?? {});
+        await this.helios.setMode(params.mode, {
+          ...(params.options ?? {}),
+          source: 'cli',
+          reason: params.reason ?? 'scene.setMode',
+          trackOverride: params.trackOverride ?? true,
+        });
         return getSceneState(this.helios);
       },
       'camera.getPose': async () => cloneJsonSafe(this.helios.cameraPose()),
       'camera.setPose': async (params) => {
-        this.helios.setCameraPose(params.pose ?? params, params.options ?? {});
+        this.helios.setCameraPose(params.pose ?? params, {
+          ...(params.options ?? {}),
+          source: 'cli',
+          reason: params.reason ?? 'camera.setPose',
+        });
         return cloneJsonSafe(this.helios.cameraPose());
       },
       'camera.transition': async (params) => {
-        await this.helios.transitionCamera(params.pose ?? params, params.options ?? {});
+        await this.helios.transitionCamera(params.pose ?? params, {
+          ...(params.options ?? {}),
+          source: 'cli',
+          reason: params.reason ?? 'camera.transition',
+        });
         return cloneJsonSafe(this.helios.cameraPose());
       },
       'camera.frame': async (params) => {
@@ -1232,7 +1889,10 @@ class BrowserBridge {
       },
       'camera.controls': async (params) => {
         if (!params || Object.keys(params).length === 0) return cloneJsonSafe(this.helios.cameraControls());
-        this.helios.cameraControls(params);
+        this.helios.cameraControls(params, {
+          source: 'cli',
+          reason: params.reason ?? 'camera.controls',
+        });
         return cloneJsonSafe(this.helios.cameraControls());
       },
       'camera.targetNodes': async (params) => {
@@ -1244,7 +1904,17 @@ class BrowserBridge {
       },
       'layout.get': async () => getLayoutState(this.helios),
       'layout.set': async (params) => {
-        const instance = this.helios.createLayout(buildLayoutOptions(this.helios, params.layout ?? params.key));
+        const key = params.layout ?? params.key;
+        if (this.helios.states?.entry?.('layout.layoutType')) {
+          this.helios.states.set('layout.layoutType', normalizeLayoutKey(key), {
+            source: 'cli',
+            reason: params.reason ?? 'layout.set',
+            scope: params.scope ?? 'network',
+            trackOverride: params.trackOverride !== false,
+          });
+          return getLayoutState(this.helios);
+        }
+        const instance = this.helios.createLayout(buildLayoutOptions(this.helios, key));
         this.helios.layout(instance);
         return getLayoutState(this.helios);
       },
@@ -1267,6 +1937,20 @@ class BrowserBridge {
         if (params.nodeMapper) payload.nodeMapper = buildMapperWithFunctions('node', this.helios.network, params.nodeMapper);
         if (params.edgeMapper) payload.edgeMapper = buildMapperWithFunctions('edge', this.helios.network, params.edgeMapper);
         this.helios.mappers(payload);
+        for (const [mode, descriptor] of [['node', params.nodeMapper], ['edge', params.edgeMapper]]) {
+          if (!descriptor || typeof descriptor !== 'object') continue;
+          for (const [channel, config] of Object.entries(descriptor)) {
+            setRegisteredCliState(this.helios, [
+              `mappers.${mode}.${channel}`,
+              `behaviors.mappers.${mode}.${channel}`,
+            ], cloneJsonSafe(config), {
+              reason: params.reason ?? 'mappers.set',
+              scope: params.scope ?? 'network',
+              trackOverride: params.trackOverride,
+              applyBinding: false,
+            });
+          }
+        }
         return {
           node: serializeMapperCollection(this.helios.nodeMapper),
           edge: serializeMapperCollection(this.helios.edgeMapper),
@@ -1274,6 +1958,7 @@ class BrowserBridge {
       },
       'mappers.reset': async () => {
         this.helios.mappers({ nodeMapper: null, edgeMapper: null });
+        this.helios.states?.reset?.('mappers', { source: 'cli', reason: 'mappers.reset' });
         return {
           node: serializeMapperCollection(this.helios.nodeMapper),
           edge: serializeMapperCollection(this.helios.edgeMapper),
@@ -1300,6 +1985,11 @@ class BrowserBridge {
       'behaviors.update': async (params) => {
         const id = params.id ?? params.behavior;
         const behavior = this.helios.useBehavior(id, params.options ?? {});
+        trackBehaviorOptionOverrides(this.helios, id, params.options ?? {}, {
+          reason: params.reason ?? 'behaviors.update',
+          scope: params.scope,
+          trackOverride: params.trackOverride,
+        });
         this.helios.requestRender?.();
         return serializeBehavior(behavior);
       },
@@ -1316,37 +2006,72 @@ class BrowserBridge {
       'filters.get': async () => cloneJsonSafe(this.helios.getGraphFilter()),
       'filters.set': async (params) => {
         this.helios.setGraphFilter(params);
+        setRegisteredCliState(this.helios, ['filters.rules', 'behaviors.filter.rules'], cloneJsonSafe(params), {
+          reason: params.reason ?? 'filters.set',
+          scope: params.scope ?? 'network',
+          trackOverride: params.trackOverride,
+        });
         return cloneJsonSafe(this.helios.getGraphFilter());
       },
       'filters.clear': async () => {
         this.helios.clearGraphFilter();
+        this.helios.states?.reset?.('filters', { source: 'cli', reason: 'filters.clear' });
         return cloneJsonSafe(this.helios.getGraphFilter());
       },
       'labels.get': async () => cloneJsonSafe(this.helios.labels()),
       'labels.set': async (params) => {
         this.helios.labels(params);
+        for (const [path, value] of flattenObjectLeaves(params)) {
+          setRegisteredCliState(this.helios, [`labels.${path}`, `behaviors.labels.${path}`], cloneJsonSafe(value), {
+            reason: params.reason ?? 'labels.set',
+            scope: params.scope ?? 'network',
+            trackOverride: params.trackOverride,
+          });
+        }
         return cloneJsonSafe(this.helios.labels());
       },
       'legends.get': async () => cloneJsonSafe(this.helios.legends()),
       'legends.set': async (params) => {
         this.helios.legends(params);
+        for (const [path, value] of flattenObjectLeaves(params)) {
+          setRegisteredCliState(this.helios, [`legends.${path}`, `behaviors.legends.${path}`], cloneJsonSafe(value), {
+            reason: params.reason ?? 'legends.set',
+            scope: params.scope ?? 'network',
+            trackOverride: params.trackOverride,
+          });
+        }
         return cloneJsonSafe(this.helios.legends());
       },
       'density.get': async () => cloneJsonSafe(this.helios.density()),
       'density.set': async (params) => {
         this.helios.density(params);
+        for (const [path, value] of flattenObjectLeaves(params)) {
+          setRegisteredCliState(this.helios, [`density.${path}`, `behaviors.density.${path}`], cloneJsonSafe(value), {
+            reason: params.reason ?? 'density.set',
+            scope: params.scope ?? 'network',
+            trackOverride: params.trackOverride,
+          });
+        }
         return cloneJsonSafe(this.helios.density());
       },
       'metrics.measure': async (params) => measureNetworkMetric(this.helios.network, params),
       'aesthetic.measure': async (params) => measureNetworkMetric(this.helios.network, params),
       'picking.pick': async (params) => this.helios.pickAttributesAt(params.x, params.y),
       'export.figurePayload': async (params) => {
-        const blob = await this.helios.exportFigureBlob(params);
+        const resolved = resolveFigureRpcOptions(this.helios, params);
+        const blob = await exportFigureRpcBlob(this.helios, params);
         return {
-          format: params.format ?? 'png',
+          format: resolved.format ?? params.format ?? 'png',
           mimeType: blob.type || 'application/octet-stream',
-          filename: params.filename ?? `figure.${params.format ?? 'png'}`,
+          filename: params.filename ?? resolved.filename ?? `figure.${resolved.format ?? params.format ?? 'png'}`,
           base64: await blobToBase64(blob),
+        };
+      },
+      'export.figureOptions': async (params) => {
+        const exporter = findOptionalBehavior(this.helios, 'exporter');
+        return {
+          options: cloneJsonSafe(resolveFigureRpcOptions(this.helios, params)),
+          state: cloneJsonSafe(exporter?.getPublicState?.() ?? null),
         };
       },
       'events.subscribe': async () => ({ supported: true }),
@@ -1357,6 +2082,9 @@ class BrowserBridge {
 
 async function bootstrap() {
   const config = await fetch('/api/config').then((response) => response.json());
+  const sessionId = config.sessionId ?? new URLSearchParams(window.location.search).get('sessionId') ?? 'unknown';
+  const persistenceId = cliPersistenceId(sessionId);
+  const desktopRuntime = isDesktopRuntime(config);
   const network = await createSeedNetwork({
     mode: config.mode === '3d' ? '3d' : '2d',
     layout: config.layout,
@@ -1366,14 +2094,44 @@ async function bootstrap() {
     mode: config.mode === '3d' ? '3d' : '2d',
     clearColor: [0, 0, 0, 1],
     projection: 'perspective',
+    ui: false,
     layout: buildLayoutOptions({ network, mode: () => config.mode }, config.layout),
     renderer: resolveRendererPreference(config.renderer) ?? undefined,
+    workspaceId: persistenceId,
+    storage: desktopRuntime
+      ? {
+          type: 'dummy',
+          workspaceId: persistenceId,
+          sessionId: persistenceId,
+          restore: false,
+          persistNetwork: false,
+          networkPersistence: { enabled: true, autosave: false, format: 'zxnet' },
+          positionPersistence: { enabled: true, autosave: false },
+          autosyncPayloadLimits: config.autosyncPayloadLimits,
+        }
+      : {
+          type: 'remote',
+          workspaceId: persistenceId,
+          sessionId: persistenceId,
+          restore: false,
+          persistNetwork: true,
+          client: new CliStorageClient(),
+          networkPersistence: { enabled: true, autosave: true, format: 'zxnet' },
+          positionPersistence: { enabled: true, autosave: true },
+          autosyncPayloadLimits: config.autosyncPayloadLimits,
+        },
+    networkPersistence: { enabled: true, autosave: !desktopRuntime, format: 'zxnet' },
+    positionPersistence: { enabled: true, autosave: !desktopRuntime },
+    persistNetwork: !desktopRuntime,
+    sessionThumbnail: { enabled: true },
     session: {
-      id: cliPersistenceId(config.sessionId ?? new URLSearchParams(window.location.search).get('sessionId') ?? 'unknown'),
-      restore: true,
+      id: persistenceId,
+      sessionId: persistenceId,
       saveInitialManifest: true,
-      networkPersistence: { enabled: true, format: 'bxnet' },
+      restore: !desktopRuntime,
+      networkPersistence: { enabled: true, autosave: !desktopRuntime, format: 'zxnet' },
     },
+    persistence: false,
   });
   await helios.ready;
   const ui = new HeliosUI({ helios, theme: 'dark', allowDrag: true });
@@ -1382,7 +2140,11 @@ async function bootstrap() {
   publishRuntimeState(helios);
   helios.on?.(EVENTS.MODE_CHANGED, () => publishRuntimeState(helios));
   const buildCliInterface = () => {
-    ui.createDemoPanel();
+    ui.createDemoPanel({
+      showNetworkFileActions: !desktopRuntime,
+      showPersistenceSync: !desktopRuntime,
+      showSessionTab: !desktopRuntime,
+    });
     ui.createMetricsPanel();
     ui.createMappersPanel({ dock: 'top-right', position: { x: 16, y: 16 } });
     ui.createLayoutPanel({ dock: 'top-right', position: { x: 16, y: 360 } });
@@ -1397,32 +2159,18 @@ async function bootstrap() {
       autoUpdateMaxFps: 60,
     });
   };
-  const sessionController = helios.persistence?.sessionController ?? null;
-  if (sessionController?.suspendDuring) {
-    await sessionController.suspendDuring(async () => {
-      buildCliInterface();
-      await waitForSessionBaselineIdle();
-      if (!helios._sessionRestoreResult) {
-        if (typeof sessionController.resetTrackingBaseline === 'function') {
-          sessionController.resetTrackingBaseline(null, { clearJournal: true });
-        } else {
-          sessionController.captureBaseline?.();
-        }
-      }
-    });
-  } else {
-    buildCliInterface();
-  }
+  buildCliInterface();
+  await waitForSessionBaselineIdle();
+  helios.storage?.setOverrideTrackingReady?.(true);
   const persistence = createCliPersistence({ helios, config });
   window.__HELIOS_CLI_PERSISTENCE__ = persistence;
-  const restored = await persistence.restore({
-    reason: 'page-load',
-    preserveSparseState: Boolean(helios._sessionRestoreResult),
-    skipFallback: Boolean(helios._sessionRestoreResult),
-  }) ?? (helios._sessionRestoreResult
-    ? { storage: 'browser-session', id: helios.persistence?.persistenceStatus?.()?.sessionId ?? null }
-    : null);
+  const restored = desktopRuntime
+    ? null
+    : helios._sessionRestoreResult
+    ? { storage: 'cli-filesystem', id: helios.storage?.persistenceStatus?.()?.sessionId ?? null }
+    : await persistence.restore({ reason: 'page-load' });
   if (restored) {
+    reapplyRestoredStateBindings(helios, 'cli-session-restore-bindings');
     console.info('Helios CLI restored persisted session state', restored);
   } else {
     await persistence.save({ fullSession: false });

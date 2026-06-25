@@ -1,27 +1,22 @@
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 import { WebSocketServer } from 'ws';
 import { createJsonLineParser, encodeMessage } from '../protocol/jsonl.js';
 import { ensureClientBundle, ensureStateDirs } from '../shared/fs.js';
-import { clientDistDir, sessionSocketPath, sessionStatePath } from '../shared/paths.js';
+import { decodeBinaryFromJson, encodeBinaryForJson, FileSessionStore } from '../shared/fileSessionStore.js';
+import { inferNetworkFormat } from '../shared/networkFormats.js';
+import { clientDistDir, sessionSocketPath, sessionStatePath, stateRoot, storageSessionsDir } from '../shared/paths.js';
 import {
   deleteSessionMeta,
   loadSessionState,
   saveSessionMeta,
   saveSessionState,
 } from '../shared/sessionRegistry.js';
-
-function inferFormatFromPath(filePath, fallback = 'bxnet') {
-  const extension = path.extname(String(filePath ?? '')).toLowerCase();
-  if (extension === '.zxnet') return 'zxnet';
-  if (extension === '.xnet') return 'xnet';
-  if (extension === '.bxnet') return 'bxnet';
-  return fallback;
-}
 
 function mimeTypeForExtension(filePath) {
   const extension = path.extname(filePath).toLowerCase();
@@ -44,6 +39,36 @@ function encodeBufferBase64(buffer) {
 
 function decodeBase64ToBuffer(value) {
   return Buffer.from(String(value ?? ''), 'base64');
+}
+
+function writableNetworkOutputPath(outputPath, format) {
+  if (!outputPath) return outputPath;
+  const normalizedFormat = String(format ?? '').toLowerCase();
+  return normalizedFormat === 'gt' && String(outputPath).toLowerCase().endsWith('.gt.zst')
+    ? outputPath.slice(0, -4)
+    : outputPath;
+}
+
+function sanitizeDownloadFilename(value, fallback = 'helios-download') {
+  const text = String(value ?? '').trim().replace(/[\\/:*?"<>|\u0000-\u001F]/g, '_');
+  return text || fallback;
+}
+
+async function uniqueDownloadPath(directory, filename) {
+  const safeFilename = sanitizeDownloadFilename(filename);
+  const extension = path.extname(safeFilename);
+  const stem = extension ? safeFilename.slice(0, -extension.length) : safeFilename;
+  let candidate = path.join(directory, safeFilename);
+  for (let index = 1; index < 1000; index += 1) {
+    try {
+      await fs.access(candidate);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return candidate;
+      throw error;
+    }
+    candidate = path.join(directory, `${stem}-${index}${extension}`);
+  }
+  return path.join(directory, `${stem}-${Date.now()}${extension}`);
 }
 
 function normalizeLayoutValue(value, fallback = 'gpu-force') {
@@ -179,6 +204,8 @@ export class SessionDaemon {
       open: false,
       renderer: 'webgpu',
       layout: 'gpu-force',
+      runtime: 'cli',
+      browserChannel: null,
       sessionId: null,
       networkPath: null,
       noGpu: false,
@@ -203,11 +230,13 @@ export class SessionDaemon {
     this.metadata = null;
     this.nextConnectionId = 1;
     this.gpu = null;
+    this.sessionStore = new FileSessionStore();
   }
 
   async start() {
     await ensureStateDirs();
     await ensureClientBundle();
+    await fs.mkdir(path.dirname(this.socketPath), { recursive: true });
     if (process.platform !== 'win32') {
       try {
         await fs.unlink(this.socketPath);
@@ -247,10 +276,16 @@ export class SessionDaemon {
       mode: this.config.mode,
       renderer: this.config.renderer,
       layout: this.config.layout,
+      runtime: this.config.runtime,
+      surface: this.config.surface ?? null,
+      client: this.config.client ?? null,
+      browserChannel: this.config.browserChannel ?? null,
       noGpu: this.config.noGpu === true,
       url: this.sessionUrl(),
       controlSocket: this.socketPath,
       sessionStatePath: sessionStatePath(this.sessionId),
+      storageRoot: stateRoot,
+      storageSessionsPath: storageSessionsDir,
       httpPort: this.httpPort ?? null,
       bridgeConnected: this.bridgeReady,
       gpu: extra.gpu ?? this.gpu ?? null,
@@ -263,7 +298,9 @@ export class SessionDaemon {
   }
 
   sessionUrl() {
-    return `http://127.0.0.1:${this.httpPort}/?sessionId=${encodeURIComponent(this.sessionId)}`;
+    const params = new URLSearchParams({ sessionId: this.sessionId });
+    if (this.config.runtime && this.config.runtime !== 'cli') params.set('runtime', this.config.runtime);
+    return `http://127.0.0.1:${this.httpPort}/?${params.toString()}`;
   }
 
   async updateMetadata(extra = {}) {
@@ -275,14 +312,24 @@ export class SessionDaemon {
     this.httpServer = http.createServer(async (request, response) => {
       try {
         const url = new URL(request.url ?? '/', this.sessionUrl());
+        if (url.pathname.startsWith('/api/storage/')) {
+          await this.handleStorageApi(request, response, url);
+          return;
+        }
         if (url.pathname === '/api/config') {
           response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
           response.end(JSON.stringify({
             sessionId: this.sessionId,
             renderer: this.config.renderer,
             layout: this.config.layout,
+            runtime: this.config.runtime,
             mode: this.config.mode,
             noGpu: this.config.noGpu === true,
+            storage: {
+              type: 'remote',
+              root: stateRoot,
+              sessionsPath: storageSessionsDir,
+            },
           }));
           return;
         }
@@ -303,6 +350,69 @@ export class SessionDaemon {
     });
     await new Promise((resolve) => this.httpServer.listen(0, '127.0.0.1', resolve));
     this.httpPort = this.httpServer.address().port;
+  }
+
+  async readJsonRequest(request, { maxBytes = 256 * 1024 * 1024 } = {}) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of request) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        const error = new Error('Request body is too large');
+        error.statusCode = 413;
+        throw error;
+      }
+      chunks.push(chunk);
+    }
+    if (chunks.length <= 0) return {};
+    const text = Buffer.concat(chunks).toString('utf8');
+    return text.trim() ? JSON.parse(text) : {};
+  }
+
+  writeJsonResponse(response, statusCode, payload) {
+    response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+    response.end(JSON.stringify(encodeBinaryForJson(payload)));
+  }
+
+  async handleStorageApi(request, response, url) {
+    const method = request.method ?? 'GET';
+    const segments = url.pathname.split('/').filter(Boolean);
+    const resource = segments[2] ?? null;
+    const id = segments[3] ? decodeURIComponent(segments.slice(3).join('/')) : null;
+
+    if (resource === 'sessions' && method === 'GET') {
+      this.writeJsonResponse(response, 200, await this.sessionStore.listSessions());
+      return;
+    }
+    if (resource === 'session' && method === 'POST') {
+      const payload = decodeBinaryFromJson(await this.readJsonRequest(request));
+      this.writeJsonResponse(response, 200, await this.sessionStore.putSession(payload.record ?? payload));
+      return;
+    }
+    if (resource === 'session' && id && method === 'GET') {
+      const record = await this.sessionStore.getSession(id);
+      this.writeJsonResponse(response, record ? 200 : 404, record ?? { error: 'not-found', id });
+      return;
+    }
+    if (resource === 'session' && id && method === 'DELETE') {
+      this.writeJsonResponse(response, 200, { deleted: await this.sessionStore.deleteSession(id), id });
+      return;
+    }
+    if (resource === 'unfinished' && method === 'GET') {
+      const workspaceId = url.searchParams.get('workspaceId');
+      this.writeJsonResponse(response, 200, {
+        sessionId: await this.sessionStore.getUnfinishedSessionId(workspaceId),
+      });
+      return;
+    }
+    if (resource === 'unfinished' && (method === 'PUT' || method === 'POST')) {
+      const payload = await this.readJsonRequest(request);
+      const sessionId = await this.sessionStore.setUnfinishedSessionId(payload.sessionId ?? payload.id ?? null, payload.workspaceId ?? null);
+      this.writeJsonResponse(response, 200, { sessionId });
+      return;
+    }
+
+    this.writeJsonResponse(response, 404, { error: 'unknown-storage-endpoint' });
   }
 
   async startBridgeServer() {
@@ -387,7 +497,7 @@ export class SessionDaemon {
       kind: 'helios-cli-session-state',
       version: 1,
       sessionId: this.sessionId,
-      persistenceId: detail.persistenceId ?? previous?.persistenceId ?? `helios-cli:${this.sessionId}`,
+      persistenceId: detail.persistenceId ?? previous?.persistenceId ?? this.sessionId,
       storage: detail.storage ?? previous?.storage ?? null,
       status: detail.status ?? previous?.status ?? null,
       overrides: detail.overrides ?? previous?.overrides ?? {},
@@ -587,14 +697,23 @@ export class SessionDaemon {
       error.code = -32602;
       throw error;
     }
-    const format = params.format ?? inferFormatFromPath(filePath);
+    const format = params.format ?? inferNetworkFormat(filePath);
     const bytes = await fs.readFile(filePath);
-    return this.callBridge('network.loadPayload', {
+    const result = await this.callBridge('network.loadPayload', {
       name: path.basename(filePath),
       format,
       base64: encodeBufferBase64(bytes),
       options: params.options ?? {},
     });
+    await this.restoreDocumentSidecar(filePath, { reason: 'network.load' });
+    if (this.config.runtime === 'desktop' || params.markSaved === true) {
+      await this.callBridge('persistence.documentSaved', {
+        reason: params.reason ?? 'network.load',
+        filePath,
+        format,
+      }).catch(() => null);
+    }
+    return result;
   }
 
   async handleNetworkReplace(params = {}) {
@@ -605,10 +724,24 @@ export class SessionDaemon {
   }
 
   async handleNetworkSave(params = {}) {
-    const result = await this.callBridge('network.savePayload', params);
-    const outputPath = params.outputPath ?? null;
+    const requestedFormat = params.format ?? (params.outputPath ? inferNetworkFormat(params.outputPath) : null);
+    const outputPath = writableNetworkOutputPath(params.outputPath ?? null, requestedFormat);
+    const result = await this.callBridge('network.savePayload', {
+      ...params,
+      outputPath,
+      filename: outputPath ? path.basename(outputPath) : params.filename,
+      format: requestedFormat ?? params.format,
+    });
     if (outputPath && result?.base64) {
       await fs.writeFile(outputPath, decodeBase64ToBuffer(result.base64));
+      await this.writeDocumentSidecar(outputPath, params);
+      if (params.markSaved === true) {
+        await this.callBridge('persistence.documentSaved', {
+          reason: params.reason ?? 'network.save',
+          filePath: outputPath,
+          format: params.format ?? result.format ?? inferNetworkFormat(outputPath),
+        }).catch(() => null);
+      }
     }
     return {
       ...result,
@@ -616,6 +749,59 @@ export class SessionDaemon {
       outputPath: outputPath ?? null,
       base64: outputPath ? undefined : result?.base64,
     };
+  }
+
+  documentSidecarPath(filePath) {
+    return `${filePath}.helios-state.json`;
+  }
+
+  formatCarriesHeliosState(format) {
+    return ['xnet', 'zxnet', 'bxnet'].includes(String(format ?? '').toLowerCase());
+  }
+
+  async writeDocumentSidecar(outputPath, params = {}) {
+    const format = params.format ?? inferNetworkFormat(outputPath);
+    const sidecarPath = this.documentSidecarPath(outputPath);
+    if (this.formatCarriesHeliosState(format)) {
+      await fs.rm(sidecarPath, { force: true }).catch(() => {});
+      return null;
+    }
+    if (params.includeVisualization !== true) return null;
+    const snapshot = await this.callBridge('persistence.exportDocumentState', {
+      reason: params.reason ?? 'network.save',
+      includeCurrentPositions: params.includeCurrentPositions !== false,
+      trackedOnly: params.trackedOnly !== false,
+    }).catch(() => null);
+    if (!snapshot) return null;
+    const payload = {
+      schema: 'helios-desktop.document-sidecar',
+      version: 1,
+      networkFile: path.basename(outputPath),
+      format,
+      savedAt: new Date().toISOString(),
+      visualizationState: snapshot,
+    };
+    await fs.writeFile(sidecarPath, `${JSON.stringify(payload, null, 2)}\n`);
+    return sidecarPath;
+  }
+
+  async restoreDocumentSidecar(filePath, options = {}) {
+    const format = inferNetworkFormat(filePath);
+    if (this.formatCarriesHeliosState(format)) return null;
+    const sidecarPath = this.documentSidecarPath(filePath);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(await fs.readFile(sidecarPath, 'utf8'));
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    }
+    const visualizationState = parsed?.visualizationState ?? parsed;
+    if (!visualizationState) return null;
+    return this.callBridge('persistence.restoreDocumentState', {
+      visualizationState,
+      reason: options.reason ?? 'document-sidecar-restore',
+    });
   }
 
   async handleExportFigure(params = {}) {
@@ -669,20 +855,29 @@ export class SessionDaemon {
           '--disable-software-rasterizer',
         ];
     if (headed) args.push('--window-size=1600,1000');
-    return {
-      channel: 'chromium',
+    const options = {
       headless: this.config.mode === 'headless',
       args,
     };
+    const browserChannel = String(this.config.browserChannel ?? '').trim();
+    if (browserChannel) {
+      options.channel = browserChannel;
+    }
+    return options;
   }
 
   managedBrowserContextOptions() {
+    const base = {
+      acceptDownloads: true,
+    };
     if (this.config.mode === 'headed') {
       return {
+        ...base,
         viewport: null,
       };
     }
     return {
+      ...base,
       viewport: { width: 1600, height: 1000 },
     };
   }
@@ -793,9 +988,26 @@ export class SessionDaemon {
     this.browserPage.on('pageerror', (error) => {
       this.emitEvent('browser.pageerror', { message: error?.message ?? String(error) });
     });
+    this.browserPage.on('download', (download) => {
+      this.saveManagedBrowserDownload(download).catch((error) => {
+        this.emitEvent('browser.downloadError', { message: error?.message ?? String(error) });
+      });
+    });
     await this.browserPage.goto(this.sessionUrl(), { waitUntil: 'networkidle' });
     await this.browserPage.waitForFunction(() => Boolean(window.__HELIOS_CLI_RUNTIME__?.ready), null, { timeout: 30_000 });
     await this.validateGpuRuntime();
+  }
+
+  async saveManagedBrowserDownload(download) {
+    const directory = path.join(os.homedir(), 'Downloads');
+    await fs.mkdir(directory, { recursive: true });
+    const suggestedFilename = sanitizeDownloadFilename(download.suggestedFilename?.() ?? null);
+    const outputPath = await uniqueDownloadPath(directory, suggestedFilename);
+    await download.saveAs(outputPath);
+    this.emitEvent('browser.download', {
+      path: outputPath,
+      suggestedFilename,
+    });
   }
 
   async openExternalBrowser() {

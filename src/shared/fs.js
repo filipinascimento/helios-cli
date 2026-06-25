@@ -1,5 +1,16 @@
 import fs from 'node:fs/promises';
-import { clientDistDir, logsDir, sessionsDir, sessionStateDir, socketsDir, stateRoot } from './paths.js';
+import {
+  clientDistDir,
+  logsDir,
+  sessionNetworksDir,
+  sessionPositionsDir,
+  sessionRecordsDir,
+  sessionsDir,
+  sessionStateDir,
+  socketsDir,
+  stateRoot,
+  storageSessionsDir,
+} from './paths.js';
 
 export async function ensureStateDirs() {
   await Promise.all([
@@ -8,6 +19,10 @@ export async function ensureStateDirs() {
     fs.mkdir(sessionStateDir, { recursive: true }),
     fs.mkdir(socketsDir, { recursive: true }),
     fs.mkdir(logsDir, { recursive: true }),
+    fs.mkdir(storageSessionsDir, { recursive: true }),
+    fs.mkdir(sessionRecordsDir, { recursive: true }),
+    fs.mkdir(sessionNetworksDir, { recursive: true }),
+    fs.mkdir(sessionPositionsDir, { recursive: true }),
   ]);
 }
 

@@ -4,8 +4,8 @@ The CLI supports headed, headless, and server sessions:
 
 ```sh
 helios session start --mode headless --renderer webgpu --layout gpu-force
-helios session start --mode headed --renderer webgpu --layout d3force3d
-helios session start --mode server --open
+helios session start --layout d3force3d
+helios session start --mode server --no-open
 ```
 
 ## Choices

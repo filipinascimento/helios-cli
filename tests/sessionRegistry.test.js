@@ -26,14 +26,14 @@ test('session registry saves and loads mirrored session state', async () => {
   const sessionId = `test-${createSessionId()}`;
   const state = {
     sessionId,
-    persistenceId: `helios-cli:${sessionId}`,
+    persistenceId: sessionId,
     overrides: { 'appearance.shaded.enabled': true },
     journal: [{ seq: 1, source: 'cli', path: 'appearance.shaded.enabled' }],
   };
   await saveSessionState(sessionId, state);
   const loaded = await loadSessionState(sessionId);
   assert.deepEqual(loaded.overrides, state.overrides);
-  assert.equal(loaded.persistenceId, `helios-cli:${sessionId}`);
+  assert.equal(loaded.persistenceId, sessionId);
   await deleteSessionState(sessionId);
   const deleted = await loadSessionState(sessionId);
   assert.equal(deleted, null);

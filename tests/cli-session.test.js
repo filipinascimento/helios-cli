@@ -30,6 +30,124 @@ async function runCli(args, options = {}) {
   return { stdout, stderr };
 }
 
+async function readJsonResponse(response) {
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+  }
+  return payload;
+}
+
+test('server session exposes daemon-owned storage API in custom storage dir', async () => {
+  const storageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helios-cli-storage-api-'));
+  const started = await runCli([
+    '--storage-dir',
+    storageDir,
+    'session',
+    'start',
+    '--mode',
+    'server',
+  ]);
+  const session = JSON.parse(started.stdout);
+  assert.equal(session.mode, 'server');
+  assert.equal(session.storageRoot, storageDir);
+  assert.equal(session.storageSessionsPath, path.join(storageDir, 'sessions'));
+
+  const sessionRecordId = 'storage-api-session';
+  const networkRecordId = `${sessionRecordId}::network-data`;
+  const networkBytes = Buffer.from([1, 2, 3, 4, 5]);
+  const apiUrl = (pathname) => new URL(pathname, session.url).toString();
+
+  try {
+    const networkRecord = await readJsonResponse(await fetch(apiUrl('/api/storage/session'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: networkRecordId,
+        kind: 'session-network-data',
+        sessionId: sessionRecordId,
+        format: 'zxnet',
+        data: {
+          __heliosBinary: 'base64',
+          data: networkBytes.toString('base64'),
+        },
+      }),
+    }));
+    assert.equal(networkRecord.kind, 'session-network-data');
+    assert.equal(networkRecord.byteLength, networkBytes.byteLength);
+    assert.equal(networkRecord.dataFile, path.join(
+      storageDir,
+      'sessions',
+      'networks',
+      `${Buffer.from(sessionRecordId).toString('base64url')}.zxnet`,
+    ));
+    assert.equal((await fs.stat(networkRecord.dataFile)).size, networkBytes.byteLength);
+
+    const saved = await readJsonResponse(await fetch(apiUrl('/api/storage/session'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: sessionRecordId,
+        kind: 'helios-web.persistence.session',
+        payload: {
+          session: {
+            id: sessionRecordId,
+            workspaceId: 'storage-api-workspace',
+            unfinished: true,
+          },
+          networkData: {
+            dataRef: networkRecordId,
+          },
+          storageState: {
+            state: {
+              overrides: {
+                'scene.dimension': '3d',
+              },
+            },
+          },
+        },
+      }),
+    }));
+    assert.equal(saved.id, sessionRecordId);
+
+    const fetched = await readJsonResponse(await fetch(apiUrl(`/api/storage/session/${encodeURIComponent(sessionRecordId)}`)));
+    assert.equal(fetched.id, sessionRecordId);
+    assert.equal(fetched.payload.storageState.state.overrides['scene.dimension'], '3d');
+
+    const fetchedNetwork = await readJsonResponse(await fetch(apiUrl(`/api/storage/session/${encodeURIComponent(networkRecordId)}`)));
+    assert.equal(fetchedNetwork.data.__heliosBinary, 'base64');
+    assert.equal(Buffer.from(fetchedNetwork.data.data, 'base64').byteLength, networkBytes.byteLength);
+
+    const listed = await readJsonResponse(await fetch(apiUrl('/api/storage/sessions')));
+    assert.ok(listed.some((entry) => entry.id === sessionRecordId));
+
+    const unfinishedSet = await readJsonResponse(await fetch(apiUrl('/api/storage/unfinished'), {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        workspaceId: 'storage-api-workspace',
+        sessionId: sessionRecordId,
+      }),
+    }));
+    assert.equal(unfinishedSet.sessionId, sessionRecordId);
+
+    const unfinished = await readJsonResponse(await fetch(apiUrl('/api/storage/unfinished?workspaceId=storage-api-workspace')));
+    assert.equal(unfinished.sessionId, sessionRecordId);
+
+    const deleted = await readJsonResponse(await fetch(apiUrl(`/api/storage/session/${encodeURIComponent(sessionRecordId)}`), {
+      method: 'DELETE',
+    }));
+    assert.equal(deleted.deleted, true);
+
+    const missing = await fetch(apiUrl(`/api/storage/session/${encodeURIComponent(sessionRecordId)}`));
+    assert.equal(missing.status, 404);
+    await assert.rejects(fs.stat(networkRecord.dataFile), /ENOENT/);
+  } finally {
+    await runCli(['--storage-dir', storageDir, 'session', 'stop', session.sessionId], { timeout: 120_000 });
+    await fs.rm(storageDir, { recursive: true, force: true });
+  }
+});
+
 test('headless webgpu session supports hardware rendering, export, and stop', async () => {
   const started = await runCli(['session', 'start', '--mode', 'headless', '--renderer', 'webgpu'], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
@@ -48,6 +166,33 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     const state = JSON.parse(stateResult.stdout);
     assert.equal(state.network.nodeCount, 200);
     assert.equal(state.renderer, session.gpu.actualRenderer);
+
+    const stateSetResult = await runCli([
+      'state',
+      'set',
+      session.sessionId,
+      'scene.dimension',
+      '"3d"',
+      '--reason',
+      'cli-session-test',
+    ]);
+    const stateSet = JSON.parse(stateSetResult.stdout);
+    assert.equal(stateSet.value, '3d');
+
+    const stateGetResult = await runCli(['state', 'get', session.sessionId, 'scene.dimension']);
+    const stateGet = JSON.parse(stateGetResult.stdout);
+    assert.equal(stateGet.value, '3d');
+
+    const stateResetResult = await runCli([
+      'state',
+      'reset',
+      session.sessionId,
+      'scene.dimension',
+      '--reason',
+      'cli-session-test-reset',
+    ]);
+    const stateReset = JSON.parse(stateResetResult.stdout);
+    assert.ok(stateReset);
 
     const layoutUpdateResult = await runCli([
       'call',
@@ -210,7 +355,7 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
         && state.overrides?.['appearance.shaded.enabled'] === true,
     );
     assert.ok(mirroredState);
-    assert.equal(mirroredState.persistenceId, `helios-cli:${session.sessionId}`);
+    assert.equal(mirroredState.persistenceId, session.sessionId);
     assert.equal(mirroredState.storage.cli, 'filesystem');
     assert.equal(mirroredState.status.overrideCount >= 1, true);
 
@@ -222,7 +367,10 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
       '{"fullSession":true}',
     ], { timeout: 120_000 });
     const saved = JSON.parse(savedResult.stdout);
-    assert.equal(saved.id, `helios-cli:${session.sessionId}`);
+    assert.equal(saved.id, session.sessionId);
+    assert.equal(saved.thumbnail?.dataUrl, true);
+    assert.equal(saved.thumbnail?.type, 'image/png');
+    assert.ok(saved.thumbnail?.byteLength > 0);
 
     const reloadedResult = await runCli([
       'call',
@@ -253,6 +401,11 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     const exportStat = await fs.stat(exportPath);
     assert.ok(exportStat.size > 0);
     await fs.unlink(exportPath);
+
+    const clearResult = await runCli(['call', session.sessionId, 'persistence.clear']);
+    const cleared = JSON.parse(clearResult.stdout);
+    assert.equal(cleared.cleared, true);
+    assert.equal(cleared.id, session.sessionId);
   } finally {
     const stopped = await runCli(['session', 'stop', session.sessionId], { timeout: 120_000 });
     const result = JSON.parse(stopped.stdout);

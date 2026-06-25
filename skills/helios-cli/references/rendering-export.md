@@ -2,9 +2,20 @@
 
 ## Session Modes
 
-- `--mode headless`: managed Chromium, suitable for automated tests and exports.
-- `--mode headed`: managed visible Chromium, suitable for visual inspection.
-- `--mode server`: serves the client and control socket without launching a managed browser.
+- `--mode headless`: managed bundled Chromium, suitable for automated tests and exports.
+- default / `--mode server --open`: serves the client and opens the OS/default browser, suitable for interactive visual inspection.
+- `--mode server --no-open`: serves the client and control socket without launching or opening a browser.
+- `--mode headed`: managed visible bundled Chromium, intended only for Playwright-managed debugging.
+
+Plain `helios session start` uses the platform browser opener instead of Playwright's bundled "Chrome for Testing". Managed browser sessions use Playwright's bundled Chromium by default. Add `--browser-channel chrome` only when you explicitly need an installed Chrome channel. UI-triggered downloads from managed sessions are copied to `~/Downloads` using the suggested filename.
+
+Initialize the default managed browser once with:
+
+```sh
+helios browser install
+```
+
+This installs bundled Chromium. On Linux, use `helios browser install --with-deps` if system browser dependencies are missing.
 
 ## Renderer
 

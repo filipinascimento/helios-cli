@@ -11,7 +11,7 @@ The daemon infers format from file extension when `format` is omitted.
 ## Start With A File
 
 ```sh
-helios session start --mode headed --renderer webgpu --network ./graph.bxnet
+helios session start --renderer webgpu --network ./graph.bxnet
 ```
 
 ## Load Or Replace In A Running Session

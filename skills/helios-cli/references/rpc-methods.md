@@ -64,15 +64,16 @@ Omit `--json` when the method takes no payload.
 
 ## Persistence
 
-- `persistence.get`: returns the CLI persistence id, localStorage fallback key, and availability.
-- `persistence.save`: payload can include `{ "fullSession": true, "networkFormat": "bxnet" }`. Full saves persist network data plus visualization state; lightweight saves persist only visualization fallback state.
+- `state.get`, `state.set`, `state.reset`: read, write, or reset Web Next tracked state paths through `helios.states` with CLI-origin writes.
+- `persistence.get`: returns the CLI persistence id, storage status, and availability.
+- `persistence.save`: payload can include `{ "fullSession": true, "networkFormat": "bxnet", "captureThumbnail": true }`. Full saves persist network data plus sparse visualization state and capture a PNG thumbnail by default; lightweight saves persist sparse overrides only and use throttled automatic thumbnail capture.
 - `persistence.restore`: restores the current session checkpoint without reloading the page.
-- `persistence.clear`: removes the IndexedDB session checkpoint and localStorage visualization fallback.
+- `persistence.clear`: removes the CLI filesystem session checkpoint.
 - `persistence.changes`: returns journal entries since the last checkpoint by default. Payload can include `{ "since": 12, "limit": 25, "source": "user", "sinceCheckpoint": false }`.
 - `persistence.checkpoint`: marks changes through a sequence id as seen. Omit `seq` to checkpoint through the latest entry.
 - `persistence.overrides`: returns sparse overrides and dirty state.
 - `persistence.reset`: payload `{ "path": "appearance.nodeStyle.sizeScale" }` or `{ "scope": "appearance.nodeStyle" }`.
-- `persistence.flush`: payload `{ "includeNetwork": true }` writes pending overrides and optionally network data if size limits allow.
+- `persistence.flush`: payload `{ "includeNetwork": true, "captureThumbnail": "auto" }` writes pending overrides and optionally network data if size limits allow. Use `captureThumbnail: false` to preserve the existing thumbnail or provide a `thumbnail` object with a `dataUrl`.
 - `persistence.status`: returns session id, override counts, journal counts, dirty state, and network persistence status.
 - `browser.reload`: reloads the managed browser page, waits for the Helios runtime and bridge to reconnect, then returns runtime and session metadata.
 

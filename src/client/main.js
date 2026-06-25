@@ -1,5 +1,5 @@
 import HeliosNetwork, { AttributeType } from 'helios-network';
-import { Helios, HeliosUI, EVENTS, Mapper } from 'helios-web-next';
+import { Helios, HeliosUI, EVENTS, Mapper } from 'helios-web';
 
 function wsUrlForCurrentLocation() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

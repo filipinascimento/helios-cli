@@ -106,7 +106,7 @@ async function showVersion() {
   const versions = {
     cli: packageJson.version ?? null,
     'helios-network': await readPackageVersion('helios-network'),
-    'helios-web-next': await readPackageVersion('helios-web-next'),
+    'helios-web': await readPackageVersion('helios-web'),
   };
   process.stdout.write(`${JSON.stringify(versions, null, 2)}\n`);
 }

@@ -12,7 +12,7 @@ function resolveHeliosWebSource() {
   const localSource = resolve(__dirname, '../helios-web-next/src/index.js');
   if (fs.existsSync(localSource)) return localSource;
   try {
-    const packageJsonPath = require.resolve('helios-web-next/package.json');
+    const packageJsonPath = require.resolve('helios-web/package.json');
     const packageRoot = dirname(packageJsonPath);
     const packageSource = resolve(packageRoot, 'src/index.js');
     if (fs.existsSync(packageSource)) return packageSource;
@@ -37,7 +37,7 @@ export default defineConfig({
     format: 'es',
   },
   resolve: {
-    alias: heliosWebSource ? { 'helios-web-next': heliosWebSource } : {},
+    alias: heliosWebSource ? { 'helios-web': heliosWebSource } : {},
     preserveSymlinks: true,
     dedupe: ['helios-network'],
   },

@@ -35,7 +35,7 @@ jobs:
         run: npm run build
 
       - name: Run tests
-        run: npm test
+        run: node --test tests/*.test.js
 
       - name: Check npm version
         id: npm-version

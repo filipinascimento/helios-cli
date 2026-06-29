@@ -56,7 +56,7 @@ jobs:
 
       - name: Publish to npm
         if: steps.npm-version.outputs.exists != 'true'
-        run: npm publish
+        run: npm publish --provenance
 
       - name: Skip already-published npm version
         if: steps.npm-version.outputs.exists == 'true'

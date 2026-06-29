@@ -1,11 +1,11 @@
 {
-  "name": "helios-cli",
-  "version": "0.10.0",
+  "name": "helios-web-cli",
+  "version": "0.10.3",
   "description": "Agent-friendly CLI for running and controlling Helios Web sessions.",
   "private": false,
   "type": "module",
   "bin": {
-    "helios": "./bin/helios.js"
+    "helios": "bin/helios.js"
   },
   "scripts": {
     "build-client": "vite build",
@@ -14,22 +14,26 @@
   },
   "repository": {
     "type": "git",
-    "url": "git@github.com:filipinascimento/helios-cli.git"
+    "url": "git+ssh://git@github.com/filipinascimento/helios-cli.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "MIT",
   "files": [
     "bin",
     "dist",
+    "media",
     "skills",
     "src",
     "README.md",
     "vite.config.js"
   ],
   "dependencies": {
-    "helios-network": "^0.10.0",
+    "helios-network": "^0.10.3",
+    "helios-web": "^0.10.9",
     "playwright": "^1.56.1",
-    "ws": "^8.18.0",
-    "helios-web": "^0.10.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "vite": "^5.4.10"

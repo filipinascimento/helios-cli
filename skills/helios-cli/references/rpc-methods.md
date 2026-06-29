@@ -19,6 +19,7 @@ Omit `--json` when the method takes no payload.
 - `network.stats`: returns node count, edge count, node attributes, and edge attributes.
 - `network.load`: daemon-side file load. Payload `{ "path": "./graph.bxnet", "format": "bxnet" }`.
 - `network.attributeSet`: writes node, edge, or network attributes. Supports scalar values, arrays, and `functionCode`.
+- `network.categorizeAttribute`: converts a string label attribute into a real categorical attribute. Payload `{ "scope": "node", "attribute": "nsf_category" }`; omit `sortOrder` for the default frequency order.
 - `network.replace`: accepts either a file payload like `network.load` or a synthetic descriptor:
 
 ```json
@@ -32,6 +33,20 @@ Omit `--json` when the method takes no payload.
 ```
 
 - `network.save`: payload `{ "format": "bxnet", "outputPath": "./out.bxnet" }`.
+
+Use `network.attributeSet` with `functionCode` for simple derived attributes.
+The callback receives `(current, id, ordinal, network, context)`. When reading
+existing numeric buffers, cache them on `context` so the source buffer is looked
+up once inside the CLI-managed buffer-access block:
+
+```sh
+helios call "$SESSION" network.attributeSet --json '{
+  "scope": "node",
+  "name": "recent_3y",
+  "functionCode": "const year = context.year ??= network.getNodeAttributeBuffer(\"publication_year\").view; return year[id] >= 2021 ? 1 : 0;",
+  "options": { "type": "float", "dimension": 1 }
+}'
+```
 
 ## Camera
 

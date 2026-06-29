@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import HeliosNetwork, { AttributeType } from 'helios-network';
 import { loadSessionMeta, loadSessionState } from '../src/shared/sessionRegistry.js';
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +29,43 @@ async function runCli(args, options = {}) {
     maxBuffer: 16 * 1024 * 1024,
   });
   return { stdout, stderr };
+}
+
+async function waitForRpc(sessionId, method, predicate, { timeoutMs = 30_000, cliArgs = [] } = {}) {
+  const startedAt = Date.now();
+  let lastPayload = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const result = await runCli([...cliArgs, 'call', sessionId, method], { timeout: 120_000 });
+    lastPayload = JSON.parse(result.stdout);
+    if (!predicate || predicate(lastPayload)) return lastPayload;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timed out waiting for ${method}: ${JSON.stringify(lastPayload)}`);
+}
+
+async function writeUmapFixtureNetwork(directory) {
+  const network = await HeliosNetwork.create({ directed: false });
+  network.addNodes(4);
+  const edgeIds = network.addEdges([[0, 1], [1, 2], [2, 3], [3, 0]]);
+  network.defineNodeAttribute('umap_mass', AttributeType.Float, 1);
+  network.defineEdgeAttribute('umap_weight', AttributeType.Float, 1);
+  network.defineNetworkAttribute('umap', AttributeType.String, 1);
+  network.defineNetworkAttribute('umap_edge_weight_attr', AttributeType.String, 1);
+  network.defineNetworkAttribute('umap_node_mass_attr', AttributeType.String, 1);
+  network.setNetworkStringAttribute('umap', 'true');
+  network.setNetworkStringAttribute('umap_edge_weight_attr', 'umap_weight');
+  network.setNetworkStringAttribute('umap_node_mass_attr', 'umap_mass');
+  network.withBufferAccess(() => {
+    const mass = network.getNodeAttributeBuffer('umap_mass').view;
+    const weight = network.getEdgeAttributeBuffer('umap_weight').view;
+    mass.fill(1);
+    for (const edgeId of edgeIds) weight[edgeId] = 1;
+  });
+  const bytes = await network.saveXNet({ format: 'uint8array' });
+  network.dispose();
+  const filePath = path.join(directory, 'umap-fixture.xnet');
+  await fs.writeFile(filePath, bytes);
+  return filePath;
 }
 
 async function readJsonResponse(response) {
@@ -148,6 +186,191 @@ test('server session exposes daemon-owned storage API in custom storage dir', as
   }
 });
 
+test('network file load rebuilds gpu-force layout with UMAP defaults', async () => {
+  const storageDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helios-cli-umap-storage-'));
+  const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helios-cli-umap-fixture-'));
+  const networkPath = await writeUmapFixtureNetwork(fixtureDir);
+  const started = await runCli([
+    '--storage-dir',
+    storageDir,
+    'session',
+    'start',
+    '--mode',
+    'headless',
+    '--renderer',
+    'webgpu',
+    '--layout',
+    'gpu-force',
+    '--network',
+    networkPath,
+  ], { timeout: 120_000 });
+  const session = JSON.parse(started.stdout);
+
+  try {
+    const cliArgs = ['--storage-dir', storageDir];
+    await waitForRpc(session.sessionId, 'scene.getState', (state) => state.network?.nodeCount === 4, { cliArgs });
+    const layout = await waitForRpc(session.sessionId, 'layout.get', (state) => (
+      state.label === 'UMAP Force (GPU)'
+      && state.descriptor?.bindings?.some((binding) => binding.key === 'outputScale' && binding.value === 24)
+    ), { cliArgs });
+    const bindings = Object.fromEntries(layout.descriptor.bindings.map((binding) => [binding.key, binding.value]));
+    assert.equal(layout.key, 'gpu-force');
+    assert.equal(layout.label, 'UMAP Force (GPU)');
+    assert.equal(bindings.outputScale, 24);
+    assert.equal(bindings.kRepulsion, 1);
+    assert.equal(bindings.kAttraction, 1);
+    assert.equal(bindings.kGravity, 0);
+    assert.equal(bindings.alphaDecay, 0.0025);
+    const scene = await waitForRpc(session.sessionId, 'scene.getState', (state) => (
+      state.behaviors?.attached?.appearance?.state?.edgeStyle?.widthScale === 0
+    ), { cliArgs });
+    assert.equal(scene.behaviors.attached.appearance.state.edgeStyle.widthScale, 0);
+  } finally {
+    await runCli(['--storage-dir', storageDir, 'session', 'stop', session.sessionId], { timeout: 120_000 }).catch(() => null);
+    await fs.rm(storageDir, { recursive: true, force: true });
+    await fs.rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test('categorical mapper defaults use frequency ordered category18 with Others overflow', async () => {
+  const started = await runCli([
+    'session',
+    'start',
+    '--mode',
+    'headless',
+    '--renderer',
+    'webgl',
+    '--layout',
+    'static',
+  ], { timeout: 120_000 });
+  const session = JSON.parse(started.stdout);
+
+  try {
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'ranked_agent_class',
+        functionCode: 'return ordinal < 100 ? "Zebra" : (ordinal < 180 ? "Alpha" : "Beta");',
+        options: { type: 'string', dimension: 1 },
+      }),
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.categorizeAttribute',
+      '--json',
+      '{"scope":"node","attribute":"ranked_agent_class","sortOrder":"alphabetical"}',
+    ]);
+    const rankedCategoricalMapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"categorical","attribute":"ranked_agent_class"}}}',
+    ]);
+    const rankedCategoricalMapper = JSON.parse(rankedCategoricalMapperResult.stdout);
+    assert.equal(rankedCategoricalMapper.node.color.type, 'categorical');
+    assert.equal(rankedCategoricalMapper.node.color.meta.categorical.palette, 'category18');
+    assert.equal(rankedCategoricalMapper.node.color.meta.categorical.sortOrder, 'frequency');
+    assert.deepEqual(rankedCategoricalMapper.node.color.meta.categorical.labels, ['Zebra', 'Alpha', 'Beta']);
+    assert.deepEqual(rankedCategoricalMapper.node.color.domain, [2, 0, 1]);
+
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'many_agent_classes',
+        functionCode: 'return `Class ${ordinal % 20}`;',
+        options: { type: 'string', dimension: 1 },
+      }),
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.categorizeAttribute',
+      '--json',
+      '{"scope":"node","attribute":"many_agent_classes"}',
+    ]);
+    const manyCategoricalMapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"categorical","attribute":"many_agent_classes"}}}',
+    ]);
+    const manyCategoricalMapper = JSON.parse(manyCategoricalMapperResult.stdout);
+    assert.equal(manyCategoricalMapper.node.color.domain.length, 18);
+    assert.equal(manyCategoricalMapper.node.color.range.length, 18);
+    assert.equal(manyCategoricalMapper.node.color.defaultValue, '#888888ff');
+    assert.equal(manyCategoricalMapper.node.color.meta.categorical.overflowLabel, 'Others');
+  } finally {
+    await runCli(['session', 'stop', session.sessionId], { timeout: 120_000 }).catch(() => null);
+  }
+});
+
+test('attributeSet functionCode can derive from existing attribute buffers', async () => {
+  const started = await runCli([
+    'session',
+    'start',
+    '--mode',
+    'headless',
+    '--renderer',
+    'webgl',
+    '--layout',
+    'static',
+  ], { timeout: 120_000 });
+  const session = JSON.parse(started.stdout);
+
+  try {
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'score',
+        functionCode: 'return ordinal;',
+        options: { type: 'float', dimension: 1 },
+      }),
+    ]);
+    const derivedResult = await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'high_score',
+        functionCode: 'const score = context.score ??= network.getNodeAttributeBuffer("score").view; return score[id] >= 100 ? 1 : 0;',
+        options: { type: 'float', dimension: 1 },
+      }),
+    ]);
+    const derivedStats = JSON.parse(derivedResult.stdout);
+    assert.ok(derivedStats.nodeAttributes.includes('high_score'));
+
+    const mapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"colormap","attribute":"high_score","domain":[0,1],"colormap":"CET_L08-NeonBurst"}}}',
+    ]);
+    const mapper = JSON.parse(mapperResult.stdout);
+    assert.equal(mapper.node.color.attributes, 'high_score');
+    assert.equal(mapper.node.color.type, 'colormap');
+  } finally {
+    await runCli(['session', 'stop', session.sessionId], { timeout: 120_000 }).catch(() => null);
+  }
+});
+
 test('headless webgpu session supports hardware rendering, export, and stop', async () => {
   const started = await runCli(['session', 'start', '--mode', 'headless', '--renderer', 'webgpu'], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
@@ -213,14 +436,23 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
         nodeMapper: {
           size: {
             type: 'attribute',
-            attributes: 'weight',
+            attribute: 'weight',
             transformCode: 'inputs[0] * 10 + 4',
           },
         },
       }),
     ]);
     const mappers = JSON.parse(mapperResult.stdout);
+    assert.equal(mappers.node.size.attributes, 'weight');
     assert.equal(mappers.node.size.meta.transformCode, 'inputs[0] * 10 + 4');
+    const mapperReadbackResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.get',
+    ]);
+    const mapperReadback = JSON.parse(mapperReadbackResult.stdout);
+    assert.equal(mapperReadback.node.size.attributes, 'weight');
+    assert.equal(mapperReadback.node.size.meta.transformCode, 'inputs[0] * 10 + 4');
 
     const degreeResult = await runCli([
       'call',
@@ -267,6 +499,109 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     ]);
     const attributeStats = JSON.parse(attributeResult.stdout);
     assert.ok(attributeStats.nodeAttributes.includes('agent_position'));
+
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'agent_class',
+        functionCode: 'return ["Physics", "Chemistry", "Biology"][ordinal % 3];',
+        options: { type: 'string', dimension: 1 },
+      }),
+    ]);
+    const categorizedResult = await runCli([
+      'call',
+      session.sessionId,
+      'network.categorizeAttribute',
+      '--json',
+      '{"scope":"node","attribute":"agent_class"}',
+    ]);
+    const categorizedStats = JSON.parse(categorizedResult.stdout);
+    const agentClassInfo = categorizedStats.attributes.node.find((entry) => entry.name === 'agent_class');
+    assert.equal(agentClassInfo.typeName, 'Category');
+    assert.equal(agentClassInfo.categorical, true);
+
+    const categoricalMapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"categorical","attribute":"agent_class"}}}',
+    ]);
+    const categoricalMapper = JSON.parse(categoricalMapperResult.stdout);
+    assert.equal(categoricalMapper.node.color.attributes, 'agent_class');
+    assert.equal(categoricalMapper.node.color.type, 'categorical');
+    assert.deepEqual(categoricalMapper.node.color.domain, [0, 1, 2]);
+    assert.equal(categoricalMapper.node.color.range.length, 3);
+    assert.equal(categoricalMapper.node.color.meta.categorical.sortOrder, 'frequency');
+
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'many_agent_classes',
+        functionCode: 'return `Class ${ordinal % 20}`;',
+        options: { type: 'string', dimension: 1 },
+      }),
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.categorizeAttribute',
+      '--json',
+      '{"scope":"node","attribute":"many_agent_classes"}',
+    ]);
+    const manyCategoricalMapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"categorical","attribute":"many_agent_classes"}}}',
+    ]);
+    const manyCategoricalMapper = JSON.parse(manyCategoricalMapperResult.stdout);
+    assert.equal(manyCategoricalMapper.node.color.domain.length, 18);
+    assert.equal(manyCategoricalMapper.node.color.range.length, 18);
+    assert.equal(manyCategoricalMapper.node.color.defaultValue, '#888888ff');
+    assert.equal(manyCategoricalMapper.node.color.meta.categorical.palette, 'category18');
+    assert.equal(manyCategoricalMapper.node.color.meta.categorical.sortOrder, 'frequency');
+    assert.equal(manyCategoricalMapper.node.color.meta.categorical.overflowLabel, 'Others');
+
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.attributeSet',
+      '--json',
+      JSON.stringify({
+        scope: 'node',
+        name: 'ranked_agent_class',
+        functionCode: 'return ordinal < 100 ? "Zebra" : (ordinal < 180 ? "Alpha" : "Beta");',
+        options: { type: 'string', dimension: 1 },
+      }),
+    ]);
+    await runCli([
+      'call',
+      session.sessionId,
+      'network.categorizeAttribute',
+      '--json',
+      '{"scope":"node","attribute":"ranked_agent_class","sortOrder":"alphabetical"}',
+    ]);
+    const rankedCategoricalMapperResult = await runCli([
+      'call',
+      session.sessionId,
+      'mappers.set',
+      '--json',
+      '{"nodeMapper":{"color":{"type":"categorical","attribute":"ranked_agent_class"}}}',
+    ]);
+    const rankedCategoricalMapper = JSON.parse(rankedCategoricalMapperResult.stdout);
+    assert.equal(rankedCategoricalMapper.node.color.meta.categorical.sortOrder, 'frequency');
+    assert.deepEqual(rankedCategoricalMapper.node.color.meta.categorical.labels, ['Zebra', 'Alpha', 'Beta']);
+    assert.deepEqual(rankedCategoricalMapper.node.color.domain, [2, 0, 1]);
 
     const positionsFromAttributeResult = await runCli([
       'call',
@@ -347,7 +682,12 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     assert.ok(checkpoint.checkpointSeq > 0);
     const hiddenChangesResult = await runCli(['call', session.sessionId, 'persistence.changes']);
     const hiddenChanges = JSON.parse(hiddenChangesResult.stdout);
-    assert.deepEqual(hiddenChanges, []);
+    const hiddenOverrideChanges = hiddenChanges.filter((entry) => (
+      entry.source === 'cli'
+      || entry.overrideChanged === true
+      || entry.trackOverride !== false
+    ));
+    assert.deepEqual(hiddenOverrideChanges, []);
 
     const mirroredState = await waitForSessionState(
       session.sessionId,
@@ -388,7 +728,22 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
     assert.deepEqual(restoredState.mappers.node.color.value, [1, 1, 1, 1]);
     assert.equal(restoredState.behaviors.attached.appearance.state.shaded.enabled, true);
     assert.equal(restoredState.behaviors.attached.appearance.state.ambientOcclusion.enabled, true);
-    assert.ok(restoredState.network.nodeAttributes.includes('agent_position'));
+
+    const restoredPositionsResult = await runCli([
+      'call',
+      session.sessionId,
+      'positions.snapshot',
+      '--json',
+      '{"includeValues":true,"limit":3}',
+    ], { timeout: 120_000 });
+    const restoredPositions = JSON.parse(restoredPositionsResult.stdout);
+    const restoredFirstPositions = restoredPositions.values.slice(0, 9);
+    assert.deepEqual(
+      restoredFirstPositions.filter((_, index) => index % 3 !== 2),
+      [0, 0, 10, 5, 20, 10],
+    );
+    assert.ok(restoredFirstPositions.every((value) => Number.isFinite(value)));
+    assert.ok(restoredFirstPositions.filter((_, index) => index % 3 === 2).every((value) => Math.abs(value) < 1));
 
     const exportPath = path.join(os.tmpdir(), `helios-cli-export-${session.sessionId}.png`);
     await runCli([

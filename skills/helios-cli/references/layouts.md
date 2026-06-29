@@ -41,6 +41,31 @@ helios call "$SESSION" layout.setParameters --json '{
 }'
 ```
 
+## Dynamic UMAP Tuning
+
+When `layout.get` reports `forceModel: "umap"`, prefer UMAP-aware parameters and leave linear-only spring defaults alone:
+
+```sh
+helios call "$SESSION" layout.setParameters --json '{
+  "outputScale": 30,
+  "umapNegativeSampleRate": 7,
+  "sampleChurn": 0.02,
+  "kRepulsion": 1.15,
+  "kAttraction": 0.95
+}'
+```
+
+Component-aware layout controls such as `componentForces`, component seeding,
+and component gravity are for non-UMAP linear GPU-force layouts only. For UMAP
+embeddings, these controls should be absent or disabled; do not use `halo` or
+component placement to tune semantic islands.
+
+Use `camera.frame` after layout changes so exports include the full embedding:
+
+```sh
+helios call "$SESSION" camera.frame --json '{"animate":false,"resetOrientation":true}'
+```
+
 For D3 force:
 
 ```sh

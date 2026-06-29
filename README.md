@@ -10,21 +10,44 @@ The CLI starts a small local session daemon, serves a Helios Web client, opens t
 
 ## Install
 
-Install the published CLI:
+Install the published CLI and its managed browser:
 
 ```sh
-npm install -g helios-cli
+npm install -g helios-web-cli@latest
 helios browser install
 helios version
 ```
 
-For source checkout development, clone the packages next to each other:
+### Install The Agent Skill
+
+The npm package ships an agent skill at `skills/helios-cli`. Install the CLI first, then copy that skill into the agent's skills folder.
+
+From the published npm package:
+
+```sh
+SKILL_SRC="$(npm root -g)/helios-web-cli/skills/helios-cli"
+
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R "$SKILL_SRC" "${CODEX_HOME:-$HOME/.codex}/skills/helios-cli"
+
+mkdir -p ".claude/skills"
+cp -R "$SKILL_SRC" ".claude/skills/helios-cli"
+```
+
+Use `.claude/skills` for a project-local Claude install. If your Claude client supports global skills, use `~/.claude/skills` instead:
+
+```sh
+mkdir -p "$HOME/.claude/skills"
+cp -R "$SKILL_SRC" "$HOME/.claude/skills/helios-cli"
+```
+
+From a source checkout, use `skills/helios-cli` as `SKILL_SRC`.
+
+For source checkout development:
 
 ```sh
 mkdir -p helios-new
 cd helios-new
-git clone git@github.com:filipinascimento/helios-network.git helios-network-v2
-git clone git@github.com:filipinascimento/helios-web.git helios-web
 git clone git@github.com:filipinascimento/helios-cli.git
 cd helios-cli
 npm install
@@ -32,9 +55,10 @@ npm run build
 npm link
 ```
 
-The published package depends on `helios-network` and `helios-web`. Source
-checkout development can still alias the adjacent renderer source while building
-the CLI client.
+The CLI package depends on the published `helios-network` and `helios-web`
+packages. For coordinated renderer or graph-store development, publish or pack
+those packages first, then install the resulting versions here so the CLI is
+tested against the same package boundary users receive from npm.
 
 CLI browser sessions use the `helios-web` state machine and storage facade. CLI-origin changes should go through tracked state paths (`state.set` / `helios.states.set(..., { source: "cli" })`) so only explicit overrides are saved. Durable session storage is owned by the CLI daemon, not browser localStorage or IndexedDB: session JSON lives under `~/.helios/sessions`, network side records are saved as `.zxnet`/`.bxnet`/`.xnet`, position side records are saved as binary files, session thumbnails are stored as data URLs in the private session JSON payload, and runtime daemon metadata lives under `~/.helios/runtime`. Use global `--storage-dir <path>` or `HELIOS_CLI_STORAGE_DIR` to choose another root.
 
@@ -68,6 +92,14 @@ helios session start --network ./graph.bxnet
 ```
 
 Supported network extensions are `.bxnet`, `.zxnet`, `.xnet`, `.gml`, `.gt`, and `.gt.zst`.
+
+Dynamic UMAP embedding XNETs can be loaded the same way. When the file carries `umap=true` graph metadata plus the referenced `umap_weight`/`umap_mass` attributes, `--layout gpu-force` uses Helios Web's UMAP force model automatically:
+
+```sh
+helios session start --mode headless --renderer webgpu --layout gpu-force --network ./ukraine_tweets_dynamic_umap.xnet
+helios call <sessionId> layout.get
+helios call <sessionId> layout.setParameters --json '{"outputScale":30,"umapNegativeSampleRate":7,"sampleChurn":0.02}'
+```
 
 By default, `helios session start` runs in `server` mode and opens the session URL with the platform browser opener (`open` on macOS, `start` on Windows, `xdg-open` on Linux). This avoids spawning Playwright's bundled "Chrome for Testing" as a visible app. Use `--mode server --no-open` to serve only, `--mode headless` for automated rendering/export, or explicit `--mode headed` only when a Playwright-managed visible browser is wanted for debugging. Managed headed/headless sessions use bundled Chromium by default so they stay independent from the user's Chrome profile; add `--browser-channel chrome` or another Playwright browser channel only when an explicit installed browser channel is needed. Downloads triggered from the managed browser UI are copied to `~/Downloads` with the browser's suggested filename, and RPC figure exports can still write directly to an `outputPath`.
 

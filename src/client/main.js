@@ -1,5 +1,5 @@
 import HeliosNetwork, { AttributeType } from 'helios-network';
-import { Helios, HeliosUI, EVENTS, Mapper } from 'helios-web';
+import { Helios, HeliosUI, EVENTS, Mapper, colormapToScheme } from 'helios-web';
 
 function wsUrlForCurrentLocation() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -52,7 +52,25 @@ function networkHasUmapForceMetadata(network) {
   if (typeof value === 'string') {
     return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
   }
-  return Number(value) !== 0 && Number.isFinite(Number(value));
+  if (Number.isFinite(Number(value))) return Number(value) !== 0;
+  if (!network?.getNetworkAttributeInfo?.('umap')) return false;
+  const edgeWeightAttribute = String(readNetworkScalarAttribute(network, 'umap_edge_weight_attr') ?? 'umap_weight').trim();
+  return Boolean(edgeWeightAttribute && network?.hasEdgeAttribute?.(edgeWeightAttribute));
+}
+
+function applyUmapEmbeddingAppearanceDefaults(helios, { reason = 'umap-embedding-defaults' } = {}) {
+  if (!networkHasUmapForceMetadata(helios?.network)) return false;
+  if (helios.states && typeof helios.states.set === 'function') {
+    helios.states.set('appearance.edgeStyle.widthScale', 0, {
+      source: 'cli',
+      reason,
+      trackOverride: true,
+    });
+  } else if (typeof helios.edgeWidthScale === 'function') {
+    helios.edgeWidthScale(0);
+  }
+  helios.requestRender?.();
+  return true;
 }
 
 function resolveRendererPreference(value) {
@@ -93,6 +111,41 @@ function serializeMapperCollection(collection) {
     channels[name] = serializeChannelConfig(config);
   }
   return channels;
+}
+
+function stableJsonValue(value) {
+  const safe = cloneJsonSafe(value);
+  if (Array.isArray(safe)) return safe.map((entry) => stableJsonValue(entry));
+  if (!safe || typeof safe !== 'object') return safe;
+  const out = {};
+  for (const key of Object.keys(safe).sort()) out[key] = stableJsonValue(safe[key]);
+  return out;
+}
+
+function stableJsonString(value) {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function assertMapperChannelsApplied(helios, expectedByMode) {
+  const actualByMode = {
+    node: serializeMapperCollection(helios.nodeMapper),
+    edge: serializeMapperCollection(helios.edgeMapper),
+  };
+  const failures = [];
+  for (const [mode, mapper] of expectedByMode) {
+    if (!mapper?.channels) continue;
+    const actualChannels = actualByMode[mode] ?? {};
+    for (const [channel, config] of mapper.channels.entries()) {
+      const expected = serializeChannelConfig(config);
+      const actual = actualChannels[channel];
+      if (stableJsonString(actual) !== stableJsonString(expected)) {
+        failures.push(`${mode}.${channel}`);
+      }
+    }
+  }
+  if (failures.length) {
+    throw new Error(`mappers.set failed to update live mapper channel(s): ${failures.join(', ')}`);
+  }
 }
 
 function serializeLayoutBinding(binding) {
@@ -152,6 +205,68 @@ function compileAttributeFunction(source) {
   return new Function('current', 'id', 'ordinal', 'network', 'context', `return (${body});`);
 }
 
+function activeIndicesForAttributeScope(network, scope) {
+  if (scope === 'network') return Uint32Array.of(0);
+  const read = () => {
+    const source = scope === 'edge' ? network.edgeIndices : network.nodeIndices;
+    return source?.slice ? source.slice() : Uint32Array.from(source ?? []);
+  };
+  if (typeof network.withBufferAccess === 'function') {
+    return network.withBufferAccess(read, scope === 'edge' ? { edgeIndices: true } : { nodeIndices: true });
+  }
+  return read();
+}
+
+function attributeInfoForWriteScope(network, scope, name) {
+  if (!name) return null;
+  if (scope === 'edge') return network.getEdgeAttributeInfo?.(name) ?? null;
+  if (scope === 'network') return network.getNetworkAttributeInfo?.(name) ?? null;
+  return network.getNodeAttributeInfo?.(name) ?? null;
+}
+
+function attributeBufferForWriteScope(network, scope, name) {
+  if (scope === 'edge') return network.getEdgeAttributeBuffer(name);
+  if (scope === 'network') return network.getNetworkAttributeBuffer(name);
+  return network.getNodeAttributeBuffer(name);
+}
+
+function stringAttributeValueForWriteScope(network, scope, name, id) {
+  if (scope === 'edge') return network.getEdgeStringAttribute?.(name, id) ?? null;
+  if (scope === 'network') return network.getNetworkStringAttribute?.(name) ?? null;
+  return network.getNodeStringAttribute?.(name, id) ?? null;
+}
+
+function readCurrentAttributeValue(network, scope, name, info, id) {
+  if (!info || !name) return null;
+  if (Number(info.type) === AttributeType.String) {
+    return stringAttributeValueForWriteScope(network, scope, name, id);
+  }
+  const buffer = attributeBufferForWriteScope(network, scope, name);
+  const dimension = Math.max(1, Number(buffer.dimension ?? info.dimension ?? 1) || 1);
+  const offset = id * dimension;
+  if (dimension === 1) return buffer.view[offset];
+  return Array.from(buffer.view.slice(offset, offset + dimension));
+}
+
+function evaluateAttributeFunctionValues(network, scope, name, fn, context) {
+  const indices = activeIndicesForAttributeScope(network, scope);
+  const currentInfo = attributeInfoForWriteScope(network, scope, name);
+  const values = new Array(indices.length);
+  const evaluate = () => {
+    for (let ordinal = 0; ordinal < indices.length; ordinal += 1) {
+      const id = indices[ordinal] >>> 0;
+      const current = readCurrentAttributeValue(network, scope, name, currentInfo, id);
+      values[ordinal] = fn(current, id, ordinal, network, context);
+    }
+  };
+  if (typeof network.withBufferAccess === 'function') {
+    network.withBufferAccess(evaluate, scope === 'edge' ? { edgeIndices: true } : scope === 'node' ? { nodeIndices: true } : {});
+  } else {
+    evaluate();
+  }
+  return values;
+}
+
 function writeNetworkAttribute(network, params = {}) {
   const scope = String(params.scope ?? 'node').trim().toLowerCase();
   const name = params.name ?? params.attribute;
@@ -163,8 +278,9 @@ function writeNetworkAttribute(network, params = {}) {
   });
   const context = cloneJsonSafe(params.context ?? {});
   const functionCode = params.functionCode ?? params.valueCode ?? null;
-  const value = functionCode
-    ? (current, id, ordinal, net) => compileAttributeFunction(functionCode)(current, id, ordinal, net, context)
+  const compiled = compileAttributeFunction(functionCode);
+  const value = compiled
+    ? evaluateAttributeFunctionValues(network, scope, name, compiled, context)
     : normalizeAttributeWriteValue(params.values ?? params.value);
 
   if (scope === 'node') {
@@ -180,6 +296,120 @@ function writeNetworkAttribute(network, params = {}) {
     return network.networkAttribute(name, value, options);
   }
   throw new Error('network.attributeSet scope must be "node", "edge", or "network"');
+}
+
+function normalizeAttributeScope(scope) {
+  const normalized = String(scope ?? 'node').trim().toLowerCase();
+  if (normalized === 'node' || normalized === 'nodes') return 'node';
+  if (normalized === 'edge' || normalized === 'edges') return 'edge';
+  if (normalized === 'network' || normalized === 'graph') return 'network';
+  throw new Error('attribute scope must be "node", "edge", or "network"');
+}
+
+function categorizeNetworkAttribute(network, params = {}) {
+  const scope = normalizeAttributeScope(params.scope);
+  const name = params.name ?? params.attribute;
+  if (typeof name !== 'string' || !name.trim()) {
+    throw new Error('network.categorizeAttribute requires an attribute name');
+  }
+  const options = {
+    ...(params.options ?? {}),
+  };
+  if (params.sortOrder !== undefined) options.sortOrder = params.sortOrder;
+  if (options.sortOrder == null) options.sortOrder = 'frequency';
+  if (params.missingLabel !== undefined) options.missingLabel = params.missingLabel;
+
+  if (scope === 'edge') {
+    network.categorizeEdgeAttribute(name, options);
+  } else if (scope === 'network') {
+    network.categorizeNetworkAttribute(name, options);
+  } else {
+    network.categorizeNodeAttribute(name, options);
+  }
+  return { scope, name, options };
+}
+
+function naturalCompare(a, b) {
+  const left = String(a ?? '');
+  const right = String(b ?? '');
+  const re = /\d+|\D+/g;
+  const aParts = left.match(re) ?? [];
+  const bParts = right.match(re) ?? [];
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i += 1) {
+    const av = aParts[i] ?? '';
+    const bv = bParts[i] ?? '';
+    const aNum = Number(av);
+    const bNum = Number(bv);
+    const aIsNum = av && Number.isFinite(aNum);
+    const bIsNum = bv && Number.isFinite(bNum);
+    if (aIsNum && bIsNum && aNum !== bNum) return aNum - bNum;
+    if (aIsNum !== bIsNum) return aIsNum ? -1 : 1;
+    if (av !== bv) return av.localeCompare(bv);
+  }
+  return left.localeCompare(right);
+}
+
+function isSpecialNoneCategoryLabel(value) {
+  if (value == null) return true;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === 'none' || normalized === 'null';
+}
+
+function isSpecialNoneCategoryEntry(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.specialNone === true) return true;
+  if (Object.prototype.hasOwnProperty.call(entry, 'rawLabel')) {
+    return isSpecialNoneCategoryLabel(entry.rawLabel);
+  }
+  return isSpecialNoneCategoryLabel(entry.label);
+}
+
+function orderCategoricalEntries(entries, {
+  sortOrder = 'frequency',
+  manualOrder = [],
+  maxCategories = null,
+} = {}) {
+  const list = Array.isArray(entries) ? entries.slice() : [];
+  if (!list.length) return [];
+
+  if (sortOrder === 'alphabetical') {
+    list.sort((a, b) => String(a?.label ?? '').localeCompare(String(b?.label ?? '')));
+  } else if (sortOrder === 'natural') {
+    list.sort((a, b) => naturalCompare(a?.label, b?.label));
+  } else if (sortOrder === 'manual') {
+    const byId = new Map(list.map((entry) => [entry.id, entry]));
+    const ordered = manualOrder.map((id) => byId.get(id)).filter(Boolean);
+    const seen = new Set(ordered.map((entry) => entry.id));
+    for (const entry of list) {
+      if (!seen.has(entry.id)) ordered.push(entry);
+    }
+    list.splice(0, list.length, ...ordered);
+  } else {
+    list.sort((a, b) => (
+      (Number(b?.count ?? 0) - Number(a?.count ?? 0))
+      || String(a?.label ?? '').localeCompare(String(b?.label ?? ''))
+    ));
+  }
+
+  const capped = maxCategories != null && Number.isFinite(Number(maxCategories))
+    ? Math.max(1, Math.min(list.length, Math.floor(Number(maxCategories))))
+    : list.length;
+  const regular = list.filter((entry) => !isSpecialNoneCategoryEntry(entry));
+  const specialNone = list.filter((entry) => isSpecialNoneCategoryEntry(entry));
+  let visible = list.slice(0, capped);
+
+  if (capped < list.length && regular.length > 0 && specialNone.length > 0) {
+    visible = regular.slice(0, capped);
+  }
+
+  const visibleRegular = [];
+  const visibleSpecialNone = [];
+  for (const entry of visible) {
+    if (isSpecialNoneCategoryEntry(entry)) visibleSpecialNone.push(entry);
+    else visibleRegular.push(entry);
+  }
+  return visibleRegular.concat(visibleSpecialNone);
 }
 
 function applyLayoutParameters(helios, params = {}) {
@@ -274,10 +504,14 @@ function buildLayoutOptions(helios, key) {
     type: 'gpu-force',
     options: networkHasUmapForceMetadata(helios.network)
       ? {
+          forceModel: 'umap',
           mode,
           center: [0, 0, 0],
           radius,
           depth,
+          componentForces: 'off',
+          componentSeeding: false,
+          componentGravity: false,
         }
       : {
           mode,
@@ -1019,14 +1253,28 @@ function applyAppearanceOverridesFromState(helios, overrides = {}) {
 function reapplyRestoredStateBindings(helios, reason = 'cli-post-restore-bindings') {
   const overrides = helios.states?.getOverrides?.({ aliases: false });
   const preferredOverrides = helios.states?.getOverrides?.({ aliases: 'preferred' });
-  if (!overrides || typeof overrides !== 'object' || Object.keys(overrides).length === 0) return null;
-  const restored = helios.states?.restore?.(overrides, {
-    source: 'restore',
-    reason,
-    trackOverride: true,
-  });
+  const restored = overrides && typeof overrides === 'object' && Object.keys(overrides).length > 0
+    ? helios.states?.restore?.(overrides, {
+        source: 'restore',
+        reason,
+        trackOverride: true,
+      })
+    : null;
+  reapplyRestoredPositionAttribute(helios, reason);
   applyAppearanceOverridesFromState(helios, preferredOverrides ?? {});
   return restored;
+}
+
+function reapplyRestoredPositionAttribute(helios, reason = 'cli-post-restore-positions') {
+  const attribute = '_helios_visuals_position';
+  if (!helios.network?.getNodeAttributeInfo?.(attribute)) return false;
+  helios.stopLayout?.(reason);
+  const applied = helios.setLayoutPositionsFromNodeAttribute?.(attribute, { reason }) === true;
+  if (applied) {
+    helios.behavior?.layout?.positionAttribute?.(attribute);
+    helios.requestRender?.();
+  }
+  return applied;
 }
 
 function invokeBehavior(helios, params = {}) {
@@ -1305,6 +1553,187 @@ async function waitForSessionBaselineIdle() {
   await new Promise((resolve) => setTimeout(resolve, 150));
 }
 
+const CLI_CATEGORICAL_COLORS = [
+  '#1f77b4',
+  '#ff7f0e',
+  '#2ca02c',
+  '#d62728',
+  '#9467bd',
+  '#8c564b',
+  '#e377c2',
+  '#bcbd22',
+  '#17becf',
+  '#aec7e8',
+  '#ffbb78',
+  '#98df8a',
+  '#ff9896',
+  '#c5b0d5',
+  '#c49c94',
+  '#f7b6d2',
+  '#dbdb8d',
+  '#9edae5',
+];
+
+const CLI_CATEGORICAL_DEFAULT_VALUE = '#888888ff';
+
+function rgbaToHex8(value) {
+  if (!Array.isArray(value) && !ArrayBuffer.isView(value)) return null;
+  const hex = (channel, fallback) => {
+    const n = Number(channel ?? fallback);
+    return Math.round(Math.max(0, Math.min(1, Number.isFinite(n) ? n : fallback)) * 255)
+      .toString(16)
+      .padStart(2, '0');
+  };
+  return `#${hex(value[0], 0)}${hex(value[1], 0)}${hex(value[2], 0)}${hex(value[3], 1)}`;
+}
+
+function category18Palette() {
+  try {
+    const colors = colormapToScheme('category18', CLI_CATEGORICAL_COLORS.length)
+      .map((color) => rgbaToHex8(color))
+      .filter(Boolean);
+    if (colors.length === CLI_CATEGORICAL_COLORS.length) return colors;
+  } catch {
+    // Fall back to the baked category18 colors below.
+  }
+  return CLI_CATEGORICAL_COLORS;
+}
+
+function getCategoryDictionaryEntries(network, scope, attribute) {
+  const getter = scope === 'edge'
+    ? network?.getEdgeAttributeCategoryDictionary
+    : scope === 'network'
+      ? network?.getNetworkAttributeCategoryDictionary
+      : network?.getNodeAttributeCategoryDictionary;
+  if (typeof getter !== 'function') return [];
+  const dictionary = getter.call(network, attribute, { sortById: false });
+  return Array.isArray(dictionary?.entries) ? dictionary.entries : [];
+}
+
+function countCategoryAttributeValues(network, scope, attribute, entries) {
+  const bufferGetter = scope === 'edge'
+    ? network?.getEdgeAttributeBuffer
+    : scope === 'network'
+      ? network?.getNetworkAttributeBuffer
+      : network?.getNodeAttributeBuffer;
+  if (typeof bufferGetter !== 'function') return entries;
+
+  const counts = new Map(entries.map((entry) => [Number(entry.id), 0]));
+  const read = () => {
+    const buffer = bufferGetter.call(network, attribute);
+    const view = buffer?.view;
+    if (!view) return;
+    const dimension = Math.max(1, Number(buffer.dimension ?? 1));
+    for (let offset = 0; offset < view.length; offset += dimension) {
+      const id = Number(view[offset]);
+      if (counts.has(id)) counts.set(id, counts.get(id) + 1);
+    }
+  };
+  if (typeof network?.withBufferAccess === 'function') network.withBufferAccess(read);
+  else read();
+
+  return entries.map((entry) => ({
+    ...entry,
+    count: counts.get(Number(entry.id)) ?? Number(entry.count ?? 0),
+  }));
+}
+
+function primaryMapperAttribute(config) {
+  const raw = Array.isArray(config?.attributes) ? config.attributes[0] : (config?.attributes ?? config?.from);
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  return raw.trim()
+    .replace(/^@nodes?\./, '')
+    .replace(/^[@$]/, '')
+    .replace(/^node\./, '')
+    .replace(/^edge\./, '')
+    .replace(/^network\./, '');
+}
+
+function attributeInfoForScope(network, scope, attribute) {
+  if (scope === 'edge') return network?.getEdgeAttributeInfo?.(attribute) ?? null;
+  if (scope === 'network') return network?.getNetworkAttributeInfo?.(attribute) ?? null;
+  return network?.getNodeAttributeInfo?.(attribute) ?? null;
+}
+
+function completeCategoricalMapperConfig(mode, network, name, config) {
+  if (!config || typeof config !== 'object' || config.type !== 'categorical') return config;
+  const scope = mode === 'edge' ? 'edge' : mode === 'network' ? 'network' : 'node';
+  const attribute = primaryMapperAttribute(config);
+  if (!attribute) return config;
+  const info = attributeInfoForScope(network, scope, attribute);
+  if (!info || Number(info.type) !== AttributeType.Category) return config;
+  const entries = countCategoryAttributeValues(
+    network,
+    scope,
+    attribute,
+    getCategoryDictionaryEntries(network, scope, attribute),
+  )
+    .filter((entry) => Number.isFinite(Number(entry?.id)));
+  if (!entries.length) return config;
+
+  const categoricalMeta = config.meta?.categorical ?? {};
+  const palette = category18Palette();
+  const defaultSortOrder = 'frequency';
+  const sortOrder = categoricalMeta.sortOrder ?? defaultSortOrder;
+  const maxCategories = categoricalMeta.maxCategories
+    ?? (config.domain == null ? palette.length : null);
+  const orderedEntries = orderCategoricalEntries(entries, {
+    sortOrder,
+    manualOrder: categoricalMeta.manualOrder ?? [],
+    maxCategories: config.domain == null ? maxCategories : null,
+  });
+  const ids = entries.map((entry) => Number(entry.id));
+  const labelToId = new Map(entries.map((entry) => [String(entry.label ?? ''), Number(entry.id)]));
+  const generatedDomain = config.domain == null;
+  const generatedRange = config.range == null;
+  let domain = Array.isArray(config.domain)
+    ? [...config.domain]
+    : orderedEntries.map((entry) => Number(entry.id));
+  let range = Array.isArray(config.range) ? [...config.range] : null;
+
+  if (domain.some((entry) => typeof entry === 'string')) {
+    const translated = domain.map((entry) => {
+      const numeric = Number(entry);
+      if (Number.isFinite(numeric)) return numeric;
+      return labelToId.get(String(entry));
+    });
+    if (translated.every((entry) => Number.isFinite(Number(entry)))) {
+      domain = translated.map((entry) => Number(entry));
+    }
+  }
+
+  if (!domain.length || domain.some((entry) => !ids.includes(Number(entry)))) {
+    domain = generatedDomain ? orderedEntries.map((entry) => Number(entry.id)) : ids;
+  }
+  if (!range || range.length < domain.length) {
+    range = domain.map((_entry, index) => palette[index] ?? CLI_CATEGORICAL_DEFAULT_VALUE);
+  }
+  if (generatedRange && range.length > domain.length) range = range.slice(0, domain.length);
+
+  return {
+    ...config,
+    domain,
+    range,
+    defaultValue: config.defaultValue ?? CLI_CATEGORICAL_DEFAULT_VALUE,
+    meta: {
+      ...(config.meta ?? {}),
+      categorical: {
+        ...(config.meta?.categorical ?? {}),
+        sourceAttribute: attribute,
+        palette: config.meta?.categorical?.palette ?? 'category18',
+        preferScheme: config.meta?.categorical?.preferScheme ?? true,
+        sortOrder,
+        maxCategories,
+        overflow: generatedDomain && ids.length > domain.length ? 'defaultValue' : (config.meta?.categorical?.overflow ?? undefined),
+        overflowLabel: generatedDomain && ids.length > domain.length ? 'Others' : (config.meta?.categorical?.overflowLabel ?? undefined),
+        generatedDomain,
+        generatedRange,
+        labels: domain.map((id) => entries.find((entry) => Number(entry.id) === Number(id))?.label ?? String(id)),
+      },
+    },
+  };
+}
+
 function buildMapper(mode, network, descriptor) {
   if (!descriptor) return null;
   const mapper = new Mapper({ mode, network });
@@ -1313,9 +1742,24 @@ function buildMapper(mode, network, descriptor) {
     : Object.entries(descriptor);
   for (const [name, config] of entries) {
     if (!name || !config) continue;
-    mapper.setChannel(name, config);
+    const normalized = normalizeMapperAttributeAlias(config);
+    mapper.setChannel(name, completeCategoricalMapperConfig(mode, network, name, normalized));
   }
   return mapper;
+}
+
+function normalizeMapperAttributeAlias(config) {
+  if (Array.isArray(config)) return config.map((entry) => normalizeMapperAttributeAlias(entry));
+  if (!config || typeof config !== 'object') return config;
+  const next = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === 'attribute') continue;
+    next[key] = normalizeMapperAttributeAlias(value);
+  }
+  if (config.attribute !== undefined && next.attributes === undefined) {
+    next.attributes = config.attribute;
+  }
+  return next;
 }
 
 function compileMapperFunction(source, label) {
@@ -1356,6 +1800,20 @@ function hydrateMapperFunctionConfig(config, label = 'mapper') {
 
 function buildMapperWithFunctions(mode, network, descriptor) {
   return buildMapper(mode, network, hydrateMapperFunctionConfig(descriptor, `${mode}Mapper`));
+}
+
+function applyMapperChannels(helios, mode, mapper, options = {}) {
+  if (!mapper?.channels) return false;
+  const mappersBehavior = findOptionalBehavior(helios, 'mappers');
+  if (typeof mappersBehavior?.setChannelConfig !== 'function') return false;
+  let applied = false;
+  for (const [channel, config] of mapper.channels.entries()) {
+    if (!channel || !config) continue;
+    applied = mappersBehavior.setChannelConfig(mode, channel, config, {
+      trackOverride: options.trackOverride !== false,
+    }) || applied;
+  }
+  return applied;
 }
 
 function serializeMetricResult(result, { includeValuesByNode = false } = {}) {
@@ -1439,6 +1897,7 @@ async function measureNetworkMetric(network, params = {}) {
 
 const MUTATING_METHODS = new Set([
   'network.attributeSet',
+  'network.categorizeAttribute',
   'network.loadPayload',
   'network.replace',
   'scene.requestRender',
@@ -1807,11 +2266,17 @@ class BrowserBridge {
         this.helios.requestRender?.();
         return getNetworkStats(this.helios);
       },
+      'network.categorizeAttribute': async (params) => {
+        categorizeNetworkAttribute(this.helios.network, params);
+        this.helios.requestRender?.();
+        return getNetworkStats(this.helios);
+      },
       'network.loadPayload': async (params) => {
         const file = fileFromBase64({
           name: params.name ?? `network.${params.format ?? 'bxnet'}`,
           base64: params.base64,
         });
+        const activeLayoutKey = normalizeLayoutKey(params.layout ?? identifyLayout(this.helios.layout()));
         await this.helios.loadNetwork(file, {
           format: params.format,
           disposeOld: true,
@@ -1819,6 +2284,12 @@ class BrowserBridge {
           keepCamera: false,
           ...(params.options ?? {}),
         });
+        if (activeLayoutKey === 'gpu-force') {
+          const instance = this.helios.createLayout(buildLayoutOptions(this.helios, activeLayoutKey));
+          this.helios.layout(instance);
+          this.helios.startLayout?.();
+        }
+        applyUmapEmbeddingAppearanceDefaults(this.helios, { reason: 'network.loadPayload.umap-embedding-defaults' });
         return getSceneState(this.helios);
       },
       'network.replace': async (params) => {
@@ -1832,6 +2303,7 @@ class BrowserBridge {
             layout: params.synthetic.layout ?? identifyLayout(this.helios.layout()),
           });
           await this.helios.replaceNetwork(network, params.options ?? {});
+          applyUmapEmbeddingAppearanceDefaults(this.helios, { reason: 'network.replace.umap-embedding-defaults' });
           return getSceneState(this.helios);
         }
         throw new Error('network.replace requires a base64 payload or synthetic descriptor');
@@ -1933,13 +2405,24 @@ class BrowserBridge {
         edge: serializeMapperCollection(this.helios.edgeMapper),
       }),
       'mappers.set': async (params) => {
+        const nodeMapper = params.nodeMapper ? buildMapperWithFunctions('node', this.helios.network, params.nodeMapper) : null;
+        const edgeMapper = params.edgeMapper ? buildMapperWithFunctions('edge', this.helios.network, params.edgeMapper) : null;
+        const requestedMappers = [['node', nodeMapper], ['edge', edgeMapper]];
+        const behaviorAppliedByMode = new Map();
+        for (const [mode, mapper] of [['node', nodeMapper], ['edge', edgeMapper]]) {
+          if (!mapper) continue;
+          behaviorAppliedByMode.set(mode, applyMapperChannels(this.helios, mode, mapper, params));
+        }
         const payload = {};
-        if (params.nodeMapper) payload.nodeMapper = buildMapperWithFunctions('node', this.helios.network, params.nodeMapper);
-        if (params.edgeMapper) payload.edgeMapper = buildMapperWithFunctions('edge', this.helios.network, params.edgeMapper);
-        this.helios.mappers(payload);
-        for (const [mode, descriptor] of [['node', params.nodeMapper], ['edge', params.edgeMapper]]) {
-          if (!descriptor || typeof descriptor !== 'object') continue;
-          for (const [channel, config] of Object.entries(descriptor)) {
+        if (nodeMapper && behaviorAppliedByMode.get('node') !== true) payload.nodeMapper = nodeMapper;
+        if (edgeMapper && behaviorAppliedByMode.get('edge') !== true) payload.edgeMapper = edgeMapper;
+        if (Object.keys(payload).length > 0) {
+          this.helios.mappers(payload);
+        }
+        assertMapperChannelsApplied(this.helios, requestedMappers);
+        for (const [mode, mapper] of requestedMappers) {
+          if (!mapper?.channels) continue;
+          for (const [channel, config] of mapper.channels.entries()) {
             setRegisteredCliState(this.helios, [
               `mappers.${mode}.${channel}`,
               `behaviors.mappers.${mode}.${channel}`,

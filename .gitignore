@@ -5,3 +5,5 @@ npm-debug.log*
 .helios-cli/
 playwright-report/
 test-results/
+__pycache__/
+*.py[cod]

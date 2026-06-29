@@ -10,7 +10,7 @@ helios call <sessionId> mappers.set --json '<payload>'
 
 ## Shape
 
-The CLI accepts `nodeMapper` and `edgeMapper` descriptors. Each descriptor can be either:
+The CLI accepts `nodeMapper` and `edgeMapper` descriptors. For single-attribute channels, agents may pass either `attribute` or `attributes`; the CLI normalizes `attribute` to Helios Web's `attributes` field. Each descriptor can be either:
 
 ```json
 {
@@ -25,7 +25,7 @@ or an object keyed by channel:
 
 ```json
 {
-  "color": { "type": "attribute", "attribute": "community" },
+  "color": { "type": "colormap", "attribute": "community" },
   "size": { "type": "constant", "value": 8 }
 }
 ```
@@ -36,7 +36,7 @@ or an object keyed by channel:
 helios call "$SESSION" mappers.set --json '{
   "nodeMapper": {
     "color": {
-      "type": "attribute",
+      "type": "colormap",
       "attribute": "community",
       "colormap": "CET_L08-NeonBurst"
     },
@@ -69,14 +69,18 @@ helios call "$SESSION" mappers.set --json '{
 
 ## Agent Checks
 
-After setting mappers, call:
+`mappers.set` verifies that each requested channel is present in the live mapper
+after application and returns an RPC error if a channel did not stick. After
+setting mappers, still call:
 
 ```sh
 helios call "$SESSION" mappers.get
 helios call "$SESSION" scene.getState
 ```
 
-Use `mappers.reset` when you need to return to Helios defaults.
+Confirm the returned mapper channel uses the requested attribute/type before
+changing unrelated appearance settings. Use `mappers.reset` when you need to
+return to Helios defaults.
 
 ## Function-Like Custom Mappers
 
@@ -107,7 +111,7 @@ Function bodies with `return` are also allowed:
 helios call "$SESSION" mappers.set --json '{
   "nodeMapper": {
     "color": {
-      "type": "attribute",
+      "type": "colormap",
       "attributes": ["degree", "community"],
       "transformCode": "const degree = inputs[0] ?? 0; const group = inputs[1] ?? 0; return degree > 10 ? group : 0;",
       "colormap": "CET_L08-NeonBurst"

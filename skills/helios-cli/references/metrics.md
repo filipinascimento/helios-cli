@@ -52,6 +52,41 @@ helios call "$SESSION" mappers.set --json '{
 }'
 ```
 
+## Feedback-Guided Visual Styling
+
+Use graph measures as feedback before deciding final visual mappings. A practical first pass for embedding networks is degree for node size plus Leiden communities for color:
+
+```sh
+helios call "$SESSION" metrics.measure --json '{
+  "metric": "degree",
+  "options": { "outNodeAttribute": "degree" }
+}'
+
+helios call "$SESSION" metrics.measure --json '{
+  "metric": "leiden",
+  "options": {
+    "outNodeCommunityAttribute": "community",
+    "resolution": 1.1,
+    "seed": 13
+  }
+}'
+
+helios call "$SESSION" mappers.set --json '{
+  "nodeMapper": {
+    "color": {
+      "type": "colormap",
+      "attribute": "community",
+      "colormap": "CET_L08-NeonBurst"
+    },
+    "size": {
+      "type": "attribute",
+      "attribute": "degree",
+      "range": [2.5, 10]
+    }
+  }
+}'
+```
+
 ## Dimension As Aesthetic Signal
 
 ```sh
@@ -74,7 +109,7 @@ Map the output:
 helios call "$SESSION" mappers.set --json '{
   "nodeMapper": {
     "color": {
-      "type": "attribute",
+      "type": "colormap",
       "attributes": "dim_max",
       "colormap": "CET_L08-NeonBurst"
     }

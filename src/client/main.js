@@ -73,7 +73,8 @@ function applyUmapEmbeddingAppearanceDefaults(helios, { reason = 'umap-embedding
   return true;
 }
 
-function resolveRendererPreference(value) {
+function resolveRendererPreference(value, { noGpu = false } = {}) {
+  if (noGpu) return 'webgl';
   const normalized = String(value ?? '').trim().toLowerCase();
   if (normalized === 'webgl' || normalized === 'webgpu') return normalized;
   return null;
@@ -2579,7 +2580,7 @@ async function bootstrap() {
     projection: 'perspective',
     ui: false,
     layout: buildLayoutOptions({ network, mode: () => config.mode }, config.layout),
-    renderer: resolveRendererPreference(config.renderer) ?? undefined,
+    renderer: resolveRendererPreference(config.renderer, { noGpu: config.noGpu === true }) ?? undefined,
     workspaceId: persistenceId,
     storage: desktopRuntime
       ? {

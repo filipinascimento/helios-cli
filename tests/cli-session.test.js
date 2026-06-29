@@ -11,6 +11,11 @@ import { loadSessionMeta, loadSessionState } from '../src/shared/sessionRegistry
 const execFileAsync = promisify(execFile);
 const cliPath = path.resolve('./bin/helios.js');
 const cliCwd = path.resolve('.');
+const useSoftwareGpuForManagedBrowserTests = process.env.HELIOS_CLI_TEST_NO_GPU === '1';
+
+function managedBrowserGpuArgs() {
+  return useSoftwareGpuForManagedBrowserTests ? ['--no-gpu'] : [];
+}
 
 async function waitForSessionState(sessionId, predicate, { timeoutMs = 5000 } = {}) {
   const startedAt = Date.now();
@@ -203,6 +208,7 @@ test('network file load rebuilds gpu-force layout with UMAP defaults', async () 
     'gpu-force',
     '--network',
     networkPath,
+    ...managedBrowserGpuArgs(),
   ], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
 
@@ -242,6 +248,7 @@ test('categorical mapper defaults use frequency ordered category18 with Others o
     'webgl',
     '--layout',
     'static',
+    ...managedBrowserGpuArgs(),
   ], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
 
@@ -325,6 +332,7 @@ test('attributeSet functionCode can derive from existing attribute buffers', asy
     'webgl',
     '--layout',
     'static',
+    ...managedBrowserGpuArgs(),
   ], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
 
@@ -371,16 +379,28 @@ test('attributeSet functionCode can derive from existing attribute buffers', asy
   }
 });
 
-test('headless webgpu session supports hardware rendering, export, and stop', async () => {
-  const started = await runCli(['session', 'start', '--mode', 'headless', '--renderer', 'webgpu'], { timeout: 120_000 });
+test('headless webgpu session supports managed rendering, export, and stop', async () => {
+  const started = await runCli([
+    'session',
+    'start',
+    '--mode',
+    'headless',
+    '--renderer',
+    'webgpu',
+    ...managedBrowserGpuArgs(),
+  ], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
   assert.equal(session.mode, 'headless');
   assert.equal(session.renderer, 'webgpu');
   assert.equal(session.bridgeConnected, true);
   assert.equal(session.gpu?.ok, true);
-  assert.equal(session.noGpu, false);
+  assert.equal(session.noGpu, useSoftwareGpuForManagedBrowserTests);
   assert.ok(['webgpu', 'webgl2'].includes(session.gpu?.actualRenderer));
-  if (session.gpu?.actualRenderer === 'webgl2') {
+  if (useSoftwareGpuForManagedBrowserTests) {
+    assert.equal(session.gpu?.allowSoftware, true);
+    assert.equal(session.gpu?.actualRenderer, 'webgl2');
+    assert.equal(session.gpu?.webgl?.hardware, false);
+  } else if (session.gpu?.actualRenderer === 'webgl2') {
     assert.equal(session.gpu?.fallbackUsed, true);
   }
 
@@ -775,15 +795,29 @@ test('headless webgpu session supports hardware rendering, export, and stop', as
   assert.equal(meta, null);
 });
 
-test('headless webgl session uses hardware webgl2', async () => {
-  const started = await runCli(['session', 'start', '--mode', 'headless', '--renderer', 'webgl'], { timeout: 120_000 });
+test('headless webgl session validates webgl2 rendering policy', async () => {
+  const started = await runCli([
+    'session',
+    'start',
+    '--mode',
+    'headless',
+    '--renderer',
+    'webgl',
+    ...managedBrowserGpuArgs(),
+  ], { timeout: 120_000 });
   const session = JSON.parse(started.stdout);
   assert.equal(session.mode, 'headless');
   assert.equal(session.renderer, 'webgl');
+  assert.equal(session.noGpu, useSoftwareGpuForManagedBrowserTests);
   assert.equal(session.gpu?.ok, true);
   assert.equal(session.gpu?.actualRenderer, 'webgl2');
   assert.equal(session.gpu?.fallbackUsed, false);
-  assert.equal(session.gpu?.webgl?.hardware, true);
+  if (useSoftwareGpuForManagedBrowserTests) {
+    assert.equal(session.gpu?.allowSoftware, true);
+    assert.equal(session.gpu?.webgl?.hardware, false);
+  } else {
+    assert.equal(session.gpu?.webgl?.hardware, true);
+  }
 
   try {
     const stateResult = await runCli(['call', session.sessionId, 'scene.getState'], { timeout: 120_000 });
